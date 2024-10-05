@@ -1,0 +1,442 @@
+// SIL wiki syntax
+// https://appfire.atlassian.net/wiki/spaces/PSJC/pages/682295477/Dealing+with+Rich+Text+in+Cloud
+//  - Note that style tags like **bold** cannot span a paragraph (newline)
+
+include "echo";
+include "customFields";
+
+// convert template to SIL wiki style
+function template(string[] text) {
+    string s = trimAll(join(text, "\n"));
+    s = matchReplace(
+        s,
+        "\\<i\\>([\\s\\S]*?)\\<\\/i\\>",
+        "<info>\n<!\n$1\n!>\n</info>" // allow mark-up in panel
+    );
+    s = matchReplace(
+        s,
+        "\\<g\\>(.*?)\\<\\/g\\>", // color cannot span a new line
+        "{{color:#97a0af}}$1{{/color}}"
+    );
+    s = replace(s, "[", "\\[");
+    s = replace(s, "]", "\\]");
+    return s;
+}
+
+// remove whitespace and other stuff, so that templates can be compared to field values
+//  - rich text fields are represented in SIL wiki syntax. when you read a value after writing it the read value may differ from the written value.
+//    removing whitespace and a few other things makes the values equal again.
+function trimTemplate(string text) {
+    // remove all backslash (cannot be done in matchReplace for some reason - bug)
+    // remove all white space
+    // remove all {{...}}
+    return matchReplace(replace(text, "\\", ""), "(\\{\\{[\\s\\S]*?\\}\\})|\\s", "");
+}
+
+// convert SIL wiki syntax to Jira wiki syntax
+//  - this function is not used.
+function render(string[] templates) {
+    string[] templates_;
+    for (string key in arrayKeys(templates)) {
+        string text = templates[key];
+        text = matchReplace(text, "####### (.*?) #######", "h6. $1");
+        text = matchReplace(text, "###### (.*?) ######", "h5. $1");
+        text = matchReplace(text, "##### (.*?) #####", "h4. $1");
+        text = matchReplace(text, "#### (.*?) ####", "h3. $1");
+        text = matchReplace(text, "### (.*?) ###", "h2. $1");
+        text = matchReplace(text, "## (.*?) ##", "h1. $1");
+        text = matchReplace(text, "\\*\\*(.*?)\\*\\*", "\\*$1\\*"); // bold
+        text = matchReplace(text, "\\/\\/(.*?)\\/\\/", "_$1_"); // italics
+        text = matchReplace(text, "\\* (.*?)$", "\\* $1\n"); // bullet list
+        text = matchReplace(text, "\\- (.*?)$", "\\# $1\n"); // number list
+        templates_[key] = trim(text);
+    }
+    return templates_;
+}
+
+// 1. determine if a field value is copied from a template (white space must be removed to do this)
+// 2. determine if the template equals the for the issue (white space must be removed to do this)
+function updateTemplate(string text, string[] templates, string template, boolean formatted) {
+    text = formatted ? trimTemplate(text) : trim(text);
+    boolean found = text == "";
+    if (!found) {
+        for (string template in templates) {
+            template = formatted ? trimTemplate(template) : trim(template);
+            if (text == template) {
+                found = true;
+                break;
+            }
+        }
+    }
+    boolean update = found;
+    if (found) {
+        template = formatted ? trimTemplate(template) : trim(template);
+        update = text != template;
+    }
+    return update;
+}
+
+// conflunece (docs) and files link templates
+string[][] docTemplates;
+docTemplates[docsFieldName][issueTypeIdea+"."+ideaTypeFeature] = "https://dejongh.atlassian.net/wiki/x/HQBVAQ";
+docTemplates[filesFieldName][issueTypeIdea+"."+ideaTypeFeature] = "https://dejongh.dk";
+
+// idea issue templates
+string[] ideaTemplates; // description templates
+string[] ideaShortTemplates; // shortDescription templates
+ideaTemplates[ideaTypeIdea] = template({""
+    ,"As a **[user]**{{break}}"
+    +"I need **[solution]**{{break}}"
+    +"when **[context]**{{break}}"
+    +"so that **[outcome]**."
+    ,"#### Solution Proposals ####"
+    ,"[What could be a solution. Fill out if it makes sense in the specific case.]"
+    ,"#### Workaround Proposals ####"
+    ,"[What could be a workaround until a solution is delivered. Fill out if it makes sense in the specific case.]"
+    ,"#### Deadlines ####"
+    ,"[Is the solution time critical. Fill out if it makes sense in the specific case]."
+    ,"<i>"
+    ,"<g>Remember to fill out Request from, Request channel, and Request date fields. If you decide to "
+    +"realize the idea, you will need to consult the source of the idea at some point in time, and you want to "
+    +"give them credit for providing the idea.</g>"
+    ,"</i>"
+});
+ideaTemplates[ideaTypeStory] = template({""
+    ,"As a **[user]**{{break}}"
+    +"I need **[solution]**{{break}}"
+    +"when **[context]**{{break}}"
+    +"so that **[outcome]**."
+    ,"#### Solution  ####"
+    ,"[How are we going to solve this?]"
+    ,"#### Alternative Solution ####"
+    ,"[What is the best alternative solution?]"
+    ,"#### Deadlines ####"
+    ,"[Is the solution time critical. Fill out if it makes sense in the specific case.]"
+    ,"<i>"
+    ,"* <g>Link to ideas supporting it is important to do this. Use related to links.</g>"
+    ,"* <g>If this story is part of a feature, link it to the feature. Use a related to link.</g>"
+    ,"</i>"
+});
+ideaShortTemplates[ideaTypeFeature] = template({
+    "[customer/user segments] will use [feature] to achieve [outcome]"
+});
+ideaTemplates[ideaTypeFeature] = template({""
+    ,"We believe that **[customer/user segments]**{{break}}"
+    +"will use **[feature]**{{break}}"
+    +"to achieve **[outcome]**."
+    ,"#### Impact ####"
+    ,"If we realize this feature, we expect the business outcomes to be:"
+    ,"* [list positive and negatives outcomes and link your feature to its related objectives]."
+    ,"If this feature is not delivered, we expect the business impact will be:"
+    ,"* [list positive and negative outcomes]."
+    ,"#### Opportunities and Risks ####"
+    ,"* [List opportunities and risks and link to the related risks and opportunities.]"
+    ,"#### In scope ####"
+    ,"* [What is included in this feature.]"
+    ,"#### Out of scope ####"
+    ,"* [What is not included in this feature.]"
+    ,"#### Deadline ####"
+    ,"This feature must be delivered before [deadline] considering that [reason for deadline]."
+    ,"#### Workaround ####"
+    ,"If this feature cannot be delivered (or until it is delivered) a workaround is [describe the workaround]."
+    ,"<i>"
+    ,"* <g>If you cannot link the feature to any objectives, take a moment to consider if you are missing an objective. "
+    +"Think about an objective as a positive outcome. Something that makes your business trive such as "
+    +"customer acquisition, customer retention, cost reduction, etc.</g>"
+    ,"* <g>When you decide to create a confluence page for a feature, move the feature documentation to that page, so that you "
+    +"have the documentation in one place. Insert a link to the documentation in the Docs field. The url in the Docs field "
+    +"is automatically inherited by issues implementing this feature.</g>"
+    ,"</i>"
+});
+ideaShortTemplates[ideaTypeObjective] = template({
+    "We want to achieve [objective] so that [impact]"
+});
+ideaTemplates[ideaTypeObjective] = template({""
+    +"We want to achieve **[objective]**{{break}}"
+    +"so that **[impact]**.{{break}}"
+    +"We believe we can achieve this because **[initiative]**{{break}}"
+    +"and we measure success by **[metric(s)]**."
+    ,"#### Key Results ####"
+    ,"* [Measurable key result - add link to related metric.]"
+    ,"#### Impact ####"
+    ,"* [What is the impact if the objective is achieved. Consider both positive and negative outcomes, and who it impacts.]"
+    ,"* [What is the impact if the objective is not achived. Consider both positive and negative outcomes, and who it impacts.]"
+    ,"#### Opportunities and Risks ####"
+    ,"* [List opportunities and risks and link to the related risks and opportunities.]"
+    ,"#### Deadline ####"
+    ,"[Fill out if it makes sense in the specific case.]"
+    ,"<i>"
+    ,"* <g>An effective objective is often a positive outcome such as more paying customers. " 
+    +"Such objectives tends to work better than objectives based on completion of an activity or a delivery such as delivery of a new feature.</g>"
+    ,"* <g>If you use the OKR framework create metrics for the key results, and link to them.</g>"
+    ,"* <g>When you decide to create a confluence page for an objective, move the objective documentation to that page, so that you "
+    +"have the documentation in one place. Insert a link to the documentation in the Docs field.</g>"
+    ,"</i>"
+});
+ideaTemplates[ideaTypeTheme] = template({""
+    +"This theme groups **[what]**{{break}}"
+    +"so that **[purpose]**."
+    ,"#### In scope ####"
+    ,"* [What is included in the theme.]"
+    ,"#### Out of scope ####"
+    ,"* [What is not included on this theme.]"
+    ,"<i>"
+    ,"* <g>A theme it is a way of grouping related stuff, it is not a thing in itself. A theme can be related improvement ideas, related feature, related objectives, etc.</g>"
+    ,"* <g>Link related stuff to themes using related to links.</g>"
+    ,"</i>"
+});
+ideaTemplates[ideaTypeRisk] = template({""
+    +"We believe **[risk]** may happen{{break}}"
+    +"and lead to **[impact]**.{{break}}"
+    +"It is likely caused by **[cause]**{{break}}"
+    +"and it is **[likelihood]** to happen within **[time frame]**{{break}}"
+    +"if we don't **[mitigation]**."
+    ,"#### Risk ####"
+    ,"* [What could happen?]"
+    ,"#### Impact ####"
+    ,"* [What is the impact if it happens?]"
+    ,"#### Cause ####"
+    ,"* [Why could it happen?]"
+    ,"#### Likelihood ####"
+    ,"[How likley is the risk to occur in a time frame?]"
+    ,"#### Mitigation ####"
+    ,"* [How can we reduce the likelihood or impact of the risk?]"
+    ,"#### Contingency ####"
+    ,"* [What do we do if the risk materializes?]"
+});
+ideaTemplates[ideaTypeOpportunity] = template({""
+    +"We believe **[opportunity]**{{break}}"
+    +"may happen and lead to **[impact]**{{break}}"
+    +"if we **[initiative]**.{{break}}"
+    +"It is likely caused by **[cause]**{{break}}"
+    +"and it is **[likelihood]**{{break}}"
+    +"to happen within **[time frame]**."
+    ,"#### Opportunity ####"
+    ,"* [What could happen?]"
+    ,"#### Initiative ####"
+    ,"* [What would it enable us to do?]"
+    ,"#### Impact ####"
+    ,"* [If we do the initiative(s) we belive the outcome will be?]"
+    ,"#### Cause ####"
+    ,"* [Why could it happen?]"
+    ,"#### Likelihood ####"
+    ,"[How likley is the opportunity to occur in a time frame?]"
+});
+ideaTemplates[ideaTypeRelease] = template({""
+    +"This release includes **[features]**{{break}}"
+    +"making it a **[risk]** release."
+    ,"#### Impact ####"
+    ,"[Who will be impacted and how?]"
+    ,"#### Risks ####"
+    ,"[What could go wrong? and how to avoid that?]"
+    ,"<note>"
+    ,"Release versions"
+    ,"<g>Related versions and their release dates are automatically added here.</g>"
+    ,"</note>"
+    ,"<i>"
+    ,"* <g>Link to the features included in the release via includes links. The release date of linked features is then automatically updated.</g>"
+    ,"* <g>Consider linking to the release stage of the feature in the plan project using delivered by links.</g>"
+    ,"* <g>Link versions in software projects to released, by adding a link form the version to the release in the version other links.</g>"
+    ,"</i>"
+});
+ideaTemplates[ideaTypeMetric] = template({""
+    +"As a **[user]**{{break}}"
+    +"I need to measure **[metric]**{{break}}"
+    +"when **[context]**{{break}}"
+    +"so that **[outcome].**"
+    ,"#### Measurement ####"
+    ,"[How are measurements done?]"
+    ,"#### Expected Results ####"
+    ,"[What do you expect the measurements to show?]"
+    ,"#### Actual Results ####"
+    ,"[Where can you see the actual measurements?]"
+    ,"<i>"
+    ,"* <g>Link metrics to objectives to measure if you achieve the outcomes you expect.</g>"
+    ,"* <g>Link metrics to features to measure if you deliver what you intended.</g>"
+    ,"</i>"
+});
+
+// issue templates are copied to the description field of new issues
+string[] issueTemplates;
+
+
+// sprint issue templates
+issueTemplates[issueTypeEpic] = template({""
+    ,"As a **[user]**{{break}}"
+    +"I need **[solution]**{{break}}"
+    +"when **[context]**{{break}}"
+    +"so that **[outcome]**."
+    ,"#### In scope  ####"
+    ,"* …"
+    ,"#### Out of scope ####"
+    ,"* …"
+    ,"<i>"
+    ,"* <g>Epics implements features or stages in the deliver project or features in the discovery project.</g>"
+    ,"</i>"
+});
+issueTemplates[issueTypeStory] = template({""
+    ,"As a **[user]**{{break}}"
+    +"I need **[solution]**{{break}}"
+    +"when **[context]**{{break}}"
+    +"so that **[outcome]**."
+    ,"#### In scope  ####"
+    ,"* …"
+    ,"#### Out of scope ####"
+    ,"* …"
+    ,"<i>"
+    ,"* <g>Epics implements features or stages in the deliver project or features in the discovery project.</g>"
+    ,"</i>"
+});
+issueTemplates[issueTypeBug] = template({""
+    ,"As a **[user]**{{break}}"
+    +"I need **[solution]**{{break}}"
+    +"when **[context]**{{break}}"
+    +"so that **[outcome]**."
+    ,"#### Solution  ####"
+    ,"How are we going to solve this?"
+    ,"#### Alternative Solution ####"
+    ,"What is the best alternative solution?"
+    ,"<i>"
+    ,"* <g>Bugs are children of epics in this project, or they are releated to issues in the support project.</g>"
+    ,"</i>"
+});
+issueTemplates[issueTypeSubtask] = template({""
+    ,"Sprint sub-task"
+});
+
+
+// plan project templates (see also stage templates)
+issueTemplates[issueTypeFeature] = template({""
+    ,"<i>"
+    ,"This issue implements/delivers a feature. Features are defined in the discovery project, and "
+    +"linked features in this project via implements links."
+    ,"#### Stages ####"
+    ,"Delivery of a feature is split into stages, so that you have an idea about how mature a feature is "
+    +"and what needs to get done to move forward with it. Each stage have its own "
+    +"child issue. Here is an overview of the stages:"
+    ,"* **Discover** Understand the problem, create solution concepts, and then moved forward with the best concept."
+    ,"* **Design** Mature the solution concept into concrete designs for architecture, user experience, etc."
+    ,"* **Develop** Create working software (or other types of deliveries)."
+    ,"* **Finalize** Prepare to release what you have built. Do final tests, get confirmation from stakeholders, update documentation, etc."
+    ,"* **Release** Make your work available to customers, users and everybody else who will use it."
+    ,"* **Hypercare** Monitor that everything is working, and used as you expected. "
+    +" Fix bugs fast, and act if users are not adopting your creation."
+    ,"* **Evaluate** What have we learned, what worked, and what must we improve. "
+    +"Is our creation working - have we build it the right way? "
+    +"Is it used as we expected - have we build the right thing? "
+    +"Where we efficent - was our way of working a success?"
+    ,"Expect that you sometimes need to revist previous stages, but beaware of how much rework you do. If "
+    +"you do a lot of rework, it indicates that you rush through some stages."
+    ,"Work on the feature started before the Discover stage. The feature impact, effort, and demand was estimated. Based on this "
+    +"it was decided to prioritize the feature. This initial work happens before the feature is created in this project, so there is no stage for that."
+    ,"#### <g>Hints</g> ####"
+    ,"* <g>When you change status or stage on this issue the new value is copied to issues that are implemented "
+    +"by or implements this feature. If rollup is set to start and/or due date, then start/due date of this issue "
+    +"is set to start/due date of the children.</g>"
+    ,"* <g>Use the Docs and Files links to link the feature to related documentation and files. The values of these fields "
+    +"are inherited to child issues, making it real easy to find the links.</g> "
+    ,"</i>"
+});
+issueTemplates[issueTypeOther] = template({""
+    +"This issue groups tasks that **[what]**."
+    ,"#### In scope ####"
+    ,"* [What tasks are in scope for this issue.]"
+    ,"#### Out of scope ####"
+    ,"* [What tasks are not in scope of this issue.]"
+    ,"<i>"
+    ,"* <g>Use tasks to group tasks that don't belong to a delivery stage.</g>"
+    ,"</i>"
+});
+issueTemplates[issueTypeTask] = template({""
+    ,"#### What must be done ####"
+    ,"…"
+    ,"#### When is it done ####"
+    ,"…"
+    ,"<i>"
+    ,"* <g>Use tasks to coordinate activities, that needs to be managed outside the sprint project.</g>"
+    ,"* <g>Use check-lists to manage sub-tasks in this project.</g>"
+    ,"</i>"
+});
+// stage issue templates
+string[] stageTemplates;
+/*
+stageTemplates[stageAssess] = template({"" // this stage is not auto created, when a feature is created in the plan project
+    ,"<i>"
+    ,"<g>Assess is the stage where to esitmat impact (value), effort and demand for the feature "
+    +"and decide if/when to move forward with the feature.</g>"
+    ,"</i>"
+});
+*/
+stageTemplates[stageDiscover] = template({""
+    ,"<i>"
+    ,"Discovery is the initial stage where you explore and define the problem your feature aims to solve. " 
+    +"It involves research, market analysis, user interviews, and competitive analysis to understand customer needs, "
+    +"market opportunities, and potential challenges."
+    ,"At this stage you shape the features' value proposition and to ensure there is a viable market for it. "
+    +"You must align with and also have the opportunity to influence the overall product value proposition " 
+    +"and set priorities for development."
+    ,"</i>"
+});
+stageTemplates[stageDesign] = template({""
+    ,"<i>"
+    ,"In the design stage the teams develop prototypes, wireframes, and design specifications, translating the insights "
+    +"from the discovery stage into tangible solutions. Key activities include user experience (UX) design, user interface (UI) design, "
+    +"and the creation of detailed technical and design documentation. The aim is to create a clear and actionable blueprint that guides "
+    +"the development process, ensuring that the product is intuitive, user-friendly, and aligned with the identified user needs "
+    +"and business goals."
+    ,"</i>"
+});
+stageTemplates[stageDevelop] = template({""
+    ,"<i>"
+    ,"The development phase in product development is where the actual creation of the product occurs based on the designs "
+    +"and plans from the previous stages. During this phase, engineers and developers build the product, writing code, "
+    +"assembling components, and integrating various systems and features. This stage involves rigorous testing, debugging, "
+    +"and refinement to ensure the product functions as intended and meets quality standards. The development phase often "
+    +"follows an iterative process, where feedback is used to make continuous improvements. The goal is to produce a working "
+    +"product that is ready for launch and aligns with the project’s objectives and user requirements."
+    ,"</i>"
+});
+stageTemplates[stageFinalize] = template({""
+    ,"<i>"
+    ,"The final phase before a feature is released is typically called the testing or quality assurance (QA) phase. " 
+    +"During this phase, the feature undergoes rigorous testing to ensure it functions correctly, meets the specified "
+    +"requirements, and is free of bugs or issues. Testing can include unit tests, integration tests, system tests, "
+    +"and user acceptance tests (UAT). The goal is to identify and fix any problems before the feature is made available to users. " 
+    +"Once the feature passes all tests and is approved, it is prepared for deployment, which involves finalizing the release plan, "
+    +"updating documentation, and ensuring all systems are ready for launch."
+    ,"</i>"
+});
+stageTemplates[stageRelease] = template({""
+    ,"<i>"
+    ,"In the release stage the new feature is deployed and made available to users. "
+    +"This stage involves moving the feature from the development or staging environment to the production environment. "
+    +"It includes final checks, such as ensuring all systems are functioning correctly, releasing updated documentation, "
+    +"and informing stakeholders and users about the new feature."
+    ,"A release might be done as a gradual rollout to a subset of users or as a full release to all users. A high risk release is "
+    +" often done incrementally, and a low risk release may be done in one step."
+    ,"After a release follows hyprecare, where the goal is to quickly address "
+    +"any issues that arise post-release and ensure a smooth introduction of the feature to users, ensuring it works as intended "
+    +"and delivers the expected value."
+    ,"</i>"
+});
+stageTemplates[stageHypercare] = template({""
+    ,"<i>"
+    +"The hypercare stage is the period immediately following a release, where heightened monitoring "
+    +"and support are provided to ensure the feature operates smoothly. During this stage, "
+    +"the development and support teams are on high alert to quickly address any issues, bugs, or user feedback that might arise. "
+    +"The goal is to stabilize the feature, minimize disruption for users, and make any necessary adjustments or fixes. "
+    +"Hypercare lasts until the feature is considered stable and fully integrated into the production environment, "
+    +"after which normal support and maintenance procedures resume."
+    ,"</i>"
+});
+stageTemplates[stageEvaluate] = template({""
+    ,"<i>"
+    ,"<g>When the feature is in stable operation and has been used by customers for some time, the performance and impact of the feature are "
+    +"assessed in the evaluation stage. This stage involves collecting and analyzing data "
+    +"on user feedback, usage, market performance, and key metrics like customer satisfaction, retention, and revenue. "
+    +"The goal is to determine whether the feature meets its objectives, satisfies user needs, and achieves the expected "
+    +"business outcomes. Based on the findings, the team can identify areas for improvement, plan updates or new features, "
+    +"and make strategic decisions about the product's future direction. This phase ensures that the product continues to evolve "
+    +"and remains relevant in the market.</g>"
+    ,"</i>"
+});

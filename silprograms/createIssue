@@ -1,0 +1,53 @@
+include "echo";
+
+//------------------------------------------------------------------------------
+// create issue json structs
+struct CreateIssueContentItem {
+    string text;
+    string type;
+}
+struct CreateIssueContent {
+    CreateIssueContentItem[] content;
+    string type;
+}
+struct CreateIssueDescription {
+    CreateIssueContent[] content;
+    string type;
+    number version;
+}
+struct CreateIssueFields {
+    JsonIdField issuetype;
+    JsonIdField project;
+    JsonKeyField parent;
+    string summary;
+    CreateIssueDescription description;
+}
+struct CreateIssue {
+    CreateIssueFields fields;
+}
+
+//------------------------------------------------------------------------------
+// use rest API to create new issue (so that we can provide parent for all issue types and other stuff)
+//  - issue should not be modified right after it is created (this problem found in relation to function cloneProjects)
+function createIssueRaw(string project, string parent, string type, string summary, string description) {
+    // echo("createIssueRaw");
+    CreateIssueContentItem item;
+    item.text = description;
+    item.type = "text";
+    CreateIssueContent content;
+    content.content = {item};
+    content.type = "paragraph";
+    CreateIssue body;
+    body.fields.project.id = getProjectIdByKey(project);
+    body.fields.parent.key = parent;
+    body.fields.issuetype.id = issueTypeIdForProject(project, type);
+    body.fields.summary = summary;
+    body.fields.description.type = "doc";
+    body.fields.description.version = 1;
+    if (description != "")
+        body.fields.description.content = {content}; // if description is empty then do not include content in array (empty string is handled as NULL)
+    string response = jiraPost("/rest/api/3/issue/", toJson(body));
+    JsonKeyField result = fromJson(response);
+    return result.key;
+}
+

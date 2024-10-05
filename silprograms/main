@@ -1,0 +1,3141 @@
+include "echo";
+include "customFields";
+include "issueFields";
+include "createIssue";
+include "linkedIssues";
+include "templates";
+include "summary";
+include "alerts";
+
+//------------------------------------------------------------------------------
+// Templates
+//------------------------------------------------------------------------------
+
+//------------------------------------------------------------------------------
+// update issue templates
+function updateTemplates(string issue) {
+    string issueType = %issue%.issueType;
+    string ideaType = %issue%.ideaType;
+    // documentation link templates
+    for (string fieldName in arrayKeys(docFields)) {
+        string fieldId = docFields[fieldName];
+        string[] templates = docTemplates[fieldName];
+        string template = templates[issueType + "." + ideaType];
+        if (updateTemplate(%issue%.%fieldId%, templates, template, false)) {
+            echo("updateTemplates: ", fieldName, " updated");
+            %issue%.%fieldId% = template;
+        }
+    }
+    //
+    string template = ideaShortTemplates[ideaType];
+    if (updateTemplate(%issue%.shortDescription, ideaShortTemplates, template, false)) {
+        echo("updateTemplates: shortDescription updated");
+        %issue%.shortDescription = ideaShortTemplates[ideaType];
+    }
+    // check if description template is unmodified. we need to trim whitespace!
+    if (issueType == issueTypeIdea)
+        template = ideaTemplates[ideaType];
+    else if (issueType == issueTypeStage)
+        template = stageTemplates[%issue%.stage];
+    else
+        template = issueTemplates[issueType];
+    if (updateTemplate(%issue%.description, ideaTemplates + stageTemplates + issueTemplates, template, true)) {
+        echo("updateTemplates: description updated");
+        %issue%.description = template;
+    }
+}
+
+//------------------------------------------------------------------------------
+// Releases
+//------------------------------------------------------------------------------
+
+//------------------------------------------------------------------------------
+// find all release dates related to an issue (search parent issues for release dates)
+//  - find release date of the issue and its parents
+//  - find number of ideas implemented by this issue
+struct FindReleases {
+    boolean[] visited;
+    boolean[] done;
+    boolean[] parentDone;
+    boolean[] childDone;
+    boolean[] issueImplements;
+    string[][] issueDownReleases;
+    string[][] issueDownVersions;
+    string[][] issueDownNames;
+    string[][] issueUpReleases;
+    string[][] issueUpVersions;
+    JVersion[][] issueUpVersionDetails;
+    string[][] issueUpNames;
+    string[][] issueIncludesReleases;
+    boolean[] hasIssueIncludesReleases;
+    string[] blockingBlocked;
+}
+FindReleases foundReleases;
+function findIncludedReleases(string issue, boolean[] visited) {
+    string[] releases;
+    if (foundReleases.hasIssueIncludesReleases[issue]) {
+        releases = foundReleases.issueIncludesReleases[issue];
+    } else {
+        if (visited[issue]) {
+            echo("loop");
+        } else {
+            visited[issue] = true;
+            if (%issue%.issueType == issueTypeIdea) {
+                if (%issue%.ideaType == ideaTypeRelease) {
+                    releases += formatSummary(parseSummary(%issue%.summary, false), "path");
+                } else {
+                    IdeaDateFields dates = getIdeaDateFields(issue);
+                    if (dates.dateRelease.start != "")
+                        releases += formatSummary(parseSummary(%issue%.summary, false), "path");
+                }
+            }
+/*
+            for (string linkedIssue in getIssuesIncluding(issue)) {
+                findIncludedReleases(linkedIssue, visited);
+                releases += foundReleases.issueIncludesReleases[linkedIssue];
+            }
+*/
+            releases = arrayToSet(releases);
+            // echo("findIncludedReleases: Issue:", issue, " Releases:", releases);
+            foundReleases.issueIncludesReleases[issue] = releases;
+            foundReleases.hasIssueIncludesReleases[issue] = true;
+        }
+    }
+    return releases;
+}
+function findReleases(string issue) {
+    // echo("findReleases ", issue);
+    if (foundReleases.done[issue]) {
+        // do nothing
+    } else if (foundReleases.visited[issue]) {
+        infiniteLoop("findReleases", issue);
+    } else {
+        foundReleases.visited[issue] = true;
+        // releases linked to this issue
+        string[] downReleases;
+        string[] downVersions;
+        string[] downNames;
+        JVersion[] upVersionDetails;
+        if (%issue%.issueType == issueTypeIdea) {
+            string s = dateRangeToString(getIdeaDateFields(issue).dateRelease);
+            if (s != "") downReleases[s] = s;
+            for (string name in findIncludedReleases(issue, {}))
+                downNames[name] = name;
+        } else {
+            string[] issueVersions = %issue%.fixVersions;
+            for (string issueVersion in issueVersions) {
+                JVersion details = getVersion(%issue%.project, issueVersion);
+                upVersionDetails["_" + details.id] = details;
+                if (!details.archived) {
+                    string s = dateToString(details.releaseDate);
+                    if (s != "") downVersions[s] = s;
+                    if (details.name != "") downNames[details.name] = details.name;
+                }
+            }
+        }
+        string[] upReleases = downReleases;
+        string[] upVersions = downVersions;
+        string[] upNames = downNames;
+        // parent releases
+        string[] implements = getIssuesImplementedBy(issue);
+        string[] includes = getIssuesIncluding(issue);
+        for (string linkedIssue in arrayToSet(implements + includes + getParents(issue))) {
+            findReleases(linkedIssue);
+            downReleases += foundReleases.issueDownReleases[linkedIssue];
+            downVersions += foundReleases.issueDownVersions[linkedIssue];
+            downNames += foundReleases.issueDownNames[linkedIssue];
+        }
+        foundReleases.issueDownReleases[issue] = arrayToSet(downReleases);
+        foundReleases.issueDownVersions[issue] = arrayToSet(downVersions);
+        foundReleases.issueDownNames[issue] = arrayToSet(downNames);
+        foundReleases.issueUpReleases[issue] = upReleases;
+        foundReleases.issueUpVersions[issue] = upVersions;
+        foundReleases.issueUpVersionDetails[issue] = upVersionDetails;
+        foundReleases.issueUpNames[issue] = upNames;
+        foundReleases.issueImplements[issue] = arraySize(implements) > 0;
+        foundReleases.done[issue] = true;
+    }
+}
+
+//------------------------------------------------------------------------------
+// update release dates of issue and also update release dates of all child issues
+//  - called from updateReleaseDates
+function updateChildReleaseDates(string issue, boolean[] visited) {
+    if (visited[issue]) {
+        echo("updateChildReleaseDates loop on issue ", issue);
+    } else if (foundReleases.childDone[issue]) {
+        echo("updateChildReleaseDates Done ", issue, " (", %issue%.summary, ")");
+    } else {
+        // echo("updateChildReleaseDates ", issue, " (", %issue%.summary, ")");
+        //
+        visited[issue] = true;
+        //
+        boolean isIdea = %issue%.issueType == issueTypeIdea;
+        // update delivered of all issue types
+        // string[] visited = found.visited;
+        // found.visited = {};
+        findReleases(issue);
+        // found.visited = visited;
+        // update release dates of children and rollup release dates from children
+        string[] implementedBy = getIssuesImplementing(issue);
+        string[] includedIn = getIssuesIncludedIn(issue);
+        for (string child in arrayToSet(includedIn + implementedBy + getChildren(issue))) {
+            visited = updateChildReleaseDates(child, visited);
+            foundReleases.issueUpReleases[issue] += foundReleases.issueUpReleases[child];
+            foundReleases.issueUpVersions[issue] += foundReleases.issueUpVersions[child];
+            foundReleases.issueUpNames[issue] += foundReleases.issueUpNames[child];
+            for (string id in arrayKeys(foundReleases.issueUpVersionDetails[child]))
+                foundReleases.issueUpVersionDetails[issue][id] = foundReleases.issueUpVersionDetails[child][id];
+        }
+        foundReleases.childDone[issue] = true;
+        //
+        string[] releases = arraySort(arrayToSet(
+            foundReleases.issueDownReleases[issue] +
+            foundReleases.issueDownVersions[issue] +
+            foundReleases.issueUpReleases[issue] +
+            foundReleases.issueUpVersions[issue]
+        ), false);
+        string[] names = arraySort(arrayToSet(
+            foundReleases.issueDownNames[issue] +
+            foundReleases.issueUpNames[issue]
+        ), false);
+        //
+        SummaryDetails details = parseSummary(%issue%.delivered_, true);
+        details.type = isIdea ? ideaTypes[%issue%.ideaType] : "";
+        details.implements = foundReleases.issueImplements[issue];
+        details.implemented = arraySize(implementedBy) > 0;
+        details.releases = join(releases, ",");
+        // echo("updateChildReleaseDates: Issue:", issue, " Releases:", details.releases);
+        formatSummary(details, "delivered", issue);
+        // update summary if issue is not an idea, but it is implementing ideas (or other issues)
+        formatSummary(combineSummary(details, parseSummary(%issue%.summary, false)), "summary", issue);
+        //
+        string text = join(names, ", ");
+        if (%issue%.releases__ != text) {
+            echo("updateChildReleaseDates: Issue:", issue, " Releases:", text);
+            string[] labels;
+            for (string name in names) 
+                labels += replace(name, " ", "_");
+            %issue%.releases_ = labels;
+            %issue%.releases__ = join(names, ", ");
+        }
+        //
+        // https://dejongh.atlassian.net/projects/ES/versions/10074
+        if (%issue%.issueType == issueTypeIdea) {
+            string old = %issue%.description;
+            string find = "\\<note\\>\\n(\\<\\!\\n)?Release Versions\\n([\\S\\s]*?)(\\!\\>\\n)?\\<\\/note\\>\\n";
+            string found = matchReplace(old, find, "+++ RELEASES +++");
+            if (!contains(found, "+++ RELEASES +++")) {
+                // echo("Update ", issue, " not found (", %issue%.summary, ")");
+            } else {
+                JVersion[] versions;
+                boolean[] isUpVersion;
+                for (JVersion version in foundReleases.issueUpVersionDetails[issue]) {
+                    versions["_" + version.id] = version;
+                    isUpVersion["_" + version.id] = true;
+                }
+                boolean[] isLinkVersion;
+                for (JVersion version in findLinkedVersions(issue)) {
+                    versions["_" + version.id] = version;
+                    isLinkVersion["_" + version.id] = true;
+                }
+                string new = "";
+                for (JVersion version in versions) {
+                    string projectKey = getProjectKey(version.projectId);
+                    new += "* [[" + getJIRABaseUrl() + "/projects/" + projectKey + "/versions/" + version.id + "||";
+                    new += version.name + " (" + projectKey + ")";
+                    if (isNotNull(version.releaseDate))
+                        new += " " + scopeRelease + dateToString(version.releaseDate);
+                    if (isUpVersion["_" + version.id])
+                        new += " " + scopeRollup;
+                    if (isLinkVersion["_" + version.id])
+                        new += " 🔗";
+                    new += "]]\n";
+                }
+                new = "<note>\n<!\nRelease Versions\n" + new + "\n!>\n</note>\n";
+                new = replace(found, "+++ RELEASES +++", new);
+                if (old != new) {
+                    echo("updateChildReleaseDates: Update description on ", issue);
+                    %issue%.description = new;
+                }
+            }
+        }
+        // TODO setFieldOptions(issue, releasesField, names);
+    }
+}
+
+//------------------------------------------------------------------------------
+function updateParentReleaseDates(string issue, boolean[] visited) {
+    // echo("updateParentReleaseDates ", issue);
+    if (!foundReleases.parentDone[issue]) {
+        if (visited[issue]) {
+            echo("updateParentReleaseDates: Loop on issue ", issue);
+        } else {
+            visited[issue] = true;
+            string[] parents = arrayToSet(getIssuesIncluding(issue) + getParentAndImplementedBy(issue));
+            if (size(parents) == 0) {
+                updateChildReleaseDates(issue, {});
+            } else {
+                for (string parent in parents)
+                 updateParentReleaseDates(parent, visited);
+            }
+            foundReleases.parentDone[issue] = true;
+        }
+    }
+}
+
+//------------------------------------------------------------------------------
+// update releate dates in issue and all child issues
+//  - called from dateReleaseChanged and deliveryQuarterChanged
+function updateReleaseDates(string issue) {
+    echo("updateReleaseDates Begin Issue:", issue);
+    // update releases
+    FindReleases newFound;
+    foundReleases = newFound;
+    updateParentReleaseDates(issue, {});
+    foundReleases = newFound;
+    echo("updateReleaseDates End Issue:", issue);
+}
+
+//------------------------------------------------------------------------------
+// is this issue blocked by or blocking other issues
+//  - called from updateDelivery and rollupStartDueDates
+function updateBlockedBlocking(string issue, SummaryDetails details) {
+    details.blocked = false;
+    details.blocking = false;
+    string[] isBlocking;
+    string[] isBlockingText;
+    string[] blockedBy;
+    string[] blockedByText;
+    if (getIssueStatusCategory(issue) != statusCategoryClosed) {
+        string s = trimAll(%issue%.waitingFor);
+        if (s != "") {
+            details.blocked = true;
+            blockedBy += replace(s, " ", "_");
+            blockedByText += s;
+        }
+        for (string linkedIssue in getIssuesBlocking(issue)) {
+            string blockDue = getIdeaDateFields(linkedIssue).dateFinish.end;
+            if (getIssueStatusCategory(linkedIssue) != statusCategoryClosed) {
+                if ((blockDue == "") or (details.start == "") or (blockDue > details.due)) { // blocking issue done after blocked issue
+                    details.blocked = true;
+                    SummaryDetails linkedDetails = parseSummary(%linkedIssue%.summary, false);
+                    blockedBy += formatSummary(linkedDetails, "label");
+                    blockedByText += formatSummary(linkedDetails, "path");
+                }
+            }
+        }
+        blockedBy = arrayToSet(arraySort(blockedBy, false));
+        for (string linkedIssue in getIssuesBlockedBy(issue)) {
+            string blockdedDue = getIdeaDateFields(linkedIssue).dateFinish.end;
+            if (getIssueStatusCategory(linkedIssue) != statusCategoryClosed) {
+                if ((blockdedDue == "") or (details.start == "") or (blockdedDue < details.due)) { // blocked issue done before blocking issue
+                    details.blocking = true;
+                    SummaryDetails linkedDetails = parseSummary(%linkedIssue%.summary, false);
+                    isBlocking += formatSummary(linkedDetails, "label");
+                    isBlockingText += formatSummary(linkedDetails, "path");
+                }
+            }
+        }
+        isBlocking = arrayToSet(arraySort(isBlocking, false));
+    }
+    if (join(%issue%.blockedBy_," ") != join(blockedBy, " ")) { // compare arrays
+        %issue%.blockedBy_ = blockedBy;
+        echo("updateBlockedBlocking Issue:", issue, " Blocked by:", join(blockedBy, " "));
+    }
+    if (join(%issue%.blocks_," ") != join(isBlocking, " ")) { // compare arrays
+        %issue%.blocks_ = isBlocking;
+        echo("updateBlockedBlocking Issue:", issue, " Blocks:", join(isBlocking, " "));
+    }
+    string s = arrayToText(warnBlocked + " ", blockedByText);
+    if (%issue%.blockedBy__ != s)
+        %issue%.blockedBy__ = s;
+    s = arrayToText(warnBlocking + " ", isBlockingText);
+    if (%issue%.blocks__ != s)
+        %issue%.blocks__ = s;
+    return details;
+}
+
+//------------------------------------------------------------------------------
+// update field Delivery
+function updateDelivery(string issue) {
+    // echo("updateDelivery ", issue);
+    boolean isIdea = %issue%.issueType == issueTypeIdea;
+    IdeaDateFields dates = getIdeaDateFields(issue);
+    string startDate = dates.dateStart.start;
+    string dueDate = dates.dateFinish.end;
+    SummaryDetails details = parseSummary(%issue%.delivered_, true);
+    details.type = isIdea ? ideaTypes[%issue%.ideaType] : "";
+    details.start = dates.dateStart.start;
+    details.due = dates.dateFinish.end;
+    details.dueBeforeStart = (
+        isNotNull(startDate) and
+        isNotNull(dueDate) and
+        (startDate > dueDate)
+    );
+    details = updateBlockedBlocking(issue, details);
+    //
+    boolean[] alerts = {};
+    alerts = setAlert(alerts, alertDueBeforeStart, details.dueBeforeStart);
+    alerts = setAlert(alerts, alertBlocking, details.blocking);
+    alerts = setAlert(alerts, alertBlocked, details.blocked);
+    alerts = updateAlerts(issue, alerts);
+    details.statusMismatch =
+            alerts[alertOpenChildren] or
+            alerts[alertAllChildrenClosed] or
+            alerts[alertNewChildren] or
+            alerts[alertClosedParent] or
+            alerts[alertNewParent] or
+            alerts[alertStatusNotAligned];
+    //
+    details.implements = arraySize(getIssuesImplementedBy(issue)) != 0;
+    details.implemented = arraySize(getIssuesImplementing(issue)) != 0;
+    formatSummary(details, "delivered", issue);
+    if (!isIdea) {
+        formatSummary(combineSummary(details, parseSummary(%issue%.summary, false)), "summary", issue);
+    }
+}
+
+//------------------------------------------------------------------------------
+// Rollup / Rolldown
+//------------------------------------------------------------------------------
+
+//------------------------------------------------------------------------------
+// todo in some cases this only works if both rolldown start and rolldown due is selected.
+//  - called from findRolldownParents
+//  - find parents to roll down from (parents that are not rolldown)
+string[][] rolldownParents;
+boolean[] hasRolldownParents;
+function findRolldownParents(string issue, boolean[] visited) {
+    string[] found;
+    if (hasRolldownParents[issue]) {
+        found = rolldownParents[issue];       
+    } else if (visited[issue]) {
+        echo("findRolldownParents: Loop on issue ", issue);
+    } else {
+        visited[issue] = true;
+        string[] options = %issue%.options_;
+        boolean rolldownStart = arrayElementExists(options, optionRolldownStart);
+        boolean rolldownDue = arrayElementExists(options, optionRolldownDue);
+        string[] parents;
+        if (rolldownStart or rolldownDue) {
+            parents = getParentAndImplementedBy(issue);
+            for (string parent in getParentAndImplementedBy(issue))
+                found += findRolldownParents(parent, visited);
+        }
+        if (!rolldownStart or !rolldownDue or (arraySize(parents) == 0))
+            found += issue;
+        rolldownParents[issue] = found;
+        hasRolldownParents[issue] = true;
+    }
+    // echo("findRolldownParents: Issue:", issue, " Parents:", found);
+    return found;
+}
+
+//------------------------------------------------------------------------------
+// find children that roll down
+//   - find "leaf" roll down nodes
+string[][] rolldownChildren;
+boolean[] hasRolldownChildren;
+function findRolldownChildren(string issue, boolean[] visited) {
+    string[] found;
+    if (hasRolldownChildren[issue]) {
+        found = rolldownChildren[issue];
+    } else {
+        if (visited[issue]) {
+            echo("findRolldownParents: Loop on issue ", issue);
+        } else {
+            visited[issue] = true;
+            for (string child in getChildrenAndImplementing(issue)) {
+                string[] options = %child%.options_;
+                boolean rolldownStart = arrayElementExists(options, optionRolldownStart);
+                boolean rolldownDue = arrayElementExists(options, optionRolldownDue);
+                if (rolldownStart or rolldownDue) {
+                    string[] childFound = findRolldownChildren(child, visited);
+                    if (arraySize(childFound) == 0)
+                        found += child;
+                    else
+                        found += childFound;
+                }
+            }
+            rolldownChildren[issue] = found;
+            hasRolldownChildren[issue] = true;
+        }
+    }
+    return found;
+}
+
+//------------------------------------------------------------------------------
+// recalculate startDate/dateStart and dueDate/dateFinish for all parent issues
+//  - also calculates releases
+//  - also calculates blockes
+struct RollupStartDueDates {
+    string startIssue;
+    string[] blockingBlocked;
+}
+function rollupStartDueDates(string issue, RollupStartDueDates rollup, boolean[] visited) {
+    // echo("rollupStartDueDates Issue:", issue, " Start");
+    //
+    if (isNull(issue)) {
+        // do nothing
+    } else if (visited[issue]) {
+        infiniteLoop("rollupStartDueDates", issue);
+    } else {
+        // exit if session is replaced
+        isSessionReplaced(rollup.startIssue, true, true);
+        // return if this issue is included in a newer session
+        if (isSessionReplaced(issue)) return rollup;
+        //
+        visited[issue] = true;
+        //
+        boolean isIdea = %issue%.issueType == issueTypeIdea;
+        SummaryDetails details = parseSummary(%issue%.delivered_, true);
+        details.type = isIdea ? ideaTypes[%issue%.ideaType] : "";
+        //
+        string[] options = %issue%.options_;
+        boolean rollupStart = arrayElementExists(options, optionRollupStart);
+        boolean rollupDue = arrayElementExists(options, optionRollupDue);
+        boolean rolldownStart = arrayElementExists(options, optionRolldownStart);
+        boolean rolldownDue = arrayElementExists(options, optionRolldownDue);
+        // echo("updateParentStartDueDates Issue:", parent, " Summary:'", %parent%.summary, "' Rollup:", rollup, " IsIdea:", isIdea);
+        IdeaDateFields dates = getIdeaDateFields(issue);
+        string currentStart = dates.dateStart.start;
+        string currentDue = dates.dateFinish.end;
+/*
+        string s = dateRangeToString(dates.dateRelease);
+        if (s != "") found.releases = addElementIfNotExist(found.releases, s);
+*/
+        // first earliest startDate and latest dueDate of parents and implementing issues
+        //   if a child rolldown from a partent that rollup then child may get incorrect parent start/due
+        string parentFirstStart;
+        string parentLastDue;
+        if (rolldownStart or rolldownDue) {
+            for (string parent in findRolldownParents(issue, {})) {
+                if (parent != issue) {
+                    // isSessionReplaced(parent, true);
+                    isSessionReplaced(rollup.startIssue, true, true);
+                    if (isSessionReplaced(parent)) return rollup;
+                    //
+                    IdeaDateFields parentDates = getIdeaDateFields(parent);
+                    string parentStart = parentDates.dateStart.start;
+                    string parentDue = parentDates.dateFinish.end;
+                    if (isNotNull(parentStart) and (isNull(parentFirstStart) or (parentStart < parentFirstStart)))
+                        parentFirstStart = parentStart;
+                    if (isNotNull(parentDue) and (isNull(parentLastDue) or (parentDue > parentLastDue)))
+                        parentLastDue = parentDue;
+                }
+            }
+        }
+        // first earliest startDate and latest dueDate of children and implementing issues
+        isSessionReplaced(rollup.startIssue, true, true);
+        string childFirstStart;
+        string childLastDue;
+        string[] implementedBy = getIssuesImplementing(issue); // used furher down
+        for (string child in arrayToSet(getChildren(issue) + implementedBy)) {
+            // isSessionReplaced(child, true);
+            isSessionReplaced(rollup.startIssue, true, true);
+            if (isSessionReplaced(child)) return rollup;
+            //
+            IdeaDateFields childDates = getIdeaDateFields(child);
+            string childStart = childDates.dateStart.start;
+            string childDue = childDates.dateFinish.end;
+            if (isNotNull(childStart) and (isNull(childFirstStart) or (childStart < childFirstStart)))
+                childFirstStart = childStart;
+            if (isNotNull(childDue) and (isNull(childLastDue) or (childDue > childLastDue)))
+                childLastDue = childDue;
+            // echo("  child ", child, " start:", childStart, " due:", childDue);
+        }
+        // echo("rollupStartDueDates issue:", issue, " currentStart:", currentStart, " currentDue:", currentDue, " childFirstStart:", childFirstStart, " childLastDue:", childLastDue, " Options:", options);
+        string newStart = currentStart;
+        string newDue = currentDue;
+        details.rollup = false;
+        details.rolldown = false;
+        if (rollupStart and (childFirstStart != "")) {
+            newStart = childFirstStart;
+            details.rollup = true;
+        }
+        if (rollupDue and (childLastDue != "")) {
+            newDue = childLastDue;
+            details.rollup = true;
+        }
+        if (rolldownStart and (parentFirstStart != "")) {
+            newStart = parentFirstStart;
+            details.rolldown = true;
+        }
+        if (rolldownDue and (parentLastDue != "")) {
+            newDue = parentLastDue;
+            details.rolldown = true;
+        }
+        if (childFirstStart == "") childFirstStart = newStart;
+        if (childLastDue == "") childLastDue = newDue;
+        if ((newStart != currentStart) or (newDue != currentDue)) {
+            echo("rollupStartDueDates  issue:", issue, " oldStart:", currentStart, " newStart:", newStart, " oldDue:", currentDue, " newDue:", newDue);
+            dates.dateStart.start = newStart;
+            dates.dateStart.end = newStart;
+            dates.dateFinish.start = newDue;
+            dates.dateFinish.end = newDue;
+            isSessionReplaced(rollup.startIssue, true, true);
+            if (isSessionReplaced(issue)) return rollup;
+            setIdeaDateFields(issue, dates);
+        }
+        details.start = dates.dateStart.start;
+        details.due = dates.dateFinish.end;
+        details.dueBeforeStart = (dates.dateStart.start != "") and (dates.dateFinish.end != "") and (dates.dateStart.start > dates.dateFinish.end);
+        details.childBeforeStart = childFirstStart < newStart;
+        details.childAfterDue = (childLastDue > newDue) and (newDue != "");
+
+        // rollup to parent issue and issues implemented by this issue
+        isSessionReplaced(rollup.startIssue, true, true);
+        string[] implements = getIssuesImplementedBy(issue); // must not contain parent (see further down)
+        for (string parent in arrayToSet(implements + getParents(issue)))
+            rollup = rollupStartDueDates(parent, rollup, visited);
+
+        // update releases
+/*
+        details.releases = join(arraySort(found.releases, false), ",");
+*/
+        // update blocked
+        rollup.blockingBlocked = arrayDeleteElement(rollup.blockingBlocked, issue);
+        details = updateBlockedBlocking(issue, details);
+        // update issues blocked by this issue
+        for (string linkedIssue in getIssuesBlockedBy(issue))
+            rollup.blockingBlocked += linkedIssue;
+        for (string linkedIssue in getIssuesBlocking(issue))
+            rollup.blockingBlocked += linkedIssue;
+        rollup.blockingBlocked = arrayToSet(rollup.blockingBlocked);
+        isSessionReplaced(rollup.startIssue, true, true);
+        if (isSessionReplaced(issue)) return rollup;
+
+        // update alerts
+        boolean[] alerts = {};
+        alerts = setAlert(alerts, alertDueBeforeStart, details.dueBeforeStart);
+        alerts = setAlert(alerts, alertChildBeforeParent, details.childBeforeStart);
+        alerts = setAlert(alerts, alertChildAfterParent, details.childAfterDue);
+        alerts = setAlert(alerts, alertBlocking, details.blocking);
+        alerts = setAlert(alerts, alertBlocked, details.blocked);
+        alerts = updateAlerts(issue, alerts);
+        details.statusMismatch =
+            alerts[alertOpenChildren] or
+            alerts[alertAllChildrenClosed] or
+            alerts[alertNewChildren] or
+            alerts[alertClosedParent] or
+            alerts[alertNewParent] or
+            alerts[alertStatusNotAligned];
+        
+        // update delivery
+        details.implements = arraySize(implements) != 0;
+        details.implemented = arraySize(implementedBy) != 0;
+        formatSummary(details, "delivered", issue);
+        // update summary
+        if (!isIdea) {
+            formatSummary(combineSummary(details, parseSummary(%issue%.summary, false)), "summary", issue);
+        }
+    }
+    //
+    // echo("rollupStartDueDates Issue:", issue, " Done");
+    //
+    return rollup;
+}
+
+//------------------------------------------------------------------------------
+// recalculate startDate, dueDate and delivered' fields
+function updateSprints(string issue, boolean[] visited) {
+    // echo("sprintChanged Issue:", issue);
+    if (visited[issue]) {
+        infiniteLoop("updateSprints", issue);
+    } else {
+        visited[issue] = true;
+        string[] sprints;
+        for (integer sprint in %issue%.sprints_)
+            sprints += replace(sprintName(sprint), " ", "_");
+        for (string child in getChildrenAndImplementing(issue))
+            sprints += %child%.sprints__;
+        %issue%.sprints__ = arraySort(arrayToSet(sprints), false);
+        for (string parent in getParentAndImplementedBy(issue))
+            updateSprints(parent, visited);
+    }
+}
+// TODO include dependency resolution in this function, so that the case:
+//   issue A change start date
+//   issue B rollup start date form issue A
+//   issue C rollup start date form issue B and A so issue B must rollup before issue C
+function updateStartDueDates(string issue, boolean updateSprint = true) {
+    // echo("updateStartDueDates Issue:", issue, " Start");
+    //
+    sysLock("sessions");
+    if (isSessionReplaced(issue, false, true)) {
+        // there is already a new session starting at this issue
+        sysUnlock("sessions");
+    } else {
+        // this is the newset session starting at this issue
+        setPersistentVar(issue, "session_start", session);
+        // if there are children with rolldown then start the rollup from them
+        string[] rolldown = arrayToSet(findRolldownChildren(issue, {}));
+        // issue is touch when rolldown children are touched, so not need to touch issue if we have any of these
+        string[] touch = size(rolldown) == 0 ? issue : rolldown;
+        for (string linkedIssue in rolldown)
+            touch += getParentAndImplementedBy(linkedIssue, true);
+        // notify other sessions that these issues are also updated
+        for (string linkedIssue in arrayToSet(touch)) {
+            if (!isSessionReplaced(linkedIssue))
+                setPersistentVar(linkedIssue, "session", session);
+        }
+        sysUnlock("sessions");
+        //
+        sysLock("queue");
+        // after locking queue check that session is not replaced
+        if (!isSessionReplaced(issue, false, true)) {
+            // echo("updateStartDueDates ", issue, " '", %issue%.summary, "'");
+            // if issue is assigned to a sprint and also rolldown/rollup dates form parents/children
+            // then dates will be first set to sprint dates and then set back to rollup/rolldown dates
+            // this could be optimized
+            boolean startDueAllSprints = (
+                elementExists(%issue%.options_, optionStartDueAllSprints) or
+                elementExists(projectsStartDueAllSprints, %issue%.project)
+            );
+            if (updateSprint and startDueAllSprints) {
+                ProjectSprints projectSprints = getProjectSprints(%issue%.project);
+                if (arraySize(projectSprints.openSprints) > 0) {
+                    IdeaDateFields issueDates = getIdeaDateFields(issue);
+                    JSprint lastSprint;
+                    for (JSprint sprint in projectSprints.openSprints) {
+                        string sprintEnd = dateToString(sprint.endDate);
+                        if ((sprintEnd != "") and (sprintEnd >= issueDates.dateFinish.end)) {
+                            if (isNull(lastSprint.endDate) or (lastSprint.endDate > sprint.endDate))
+                                lastSprint = sprint;
+                        }
+                    }
+                    integer[] issueSprints = %issue%.sprints_;
+                    if (isNotNull(lastSprint.id) and !elementExists(issueSprints, lastSprint.id)) {
+                        echo("updateStartDueDates: Update to Sprint Name:", lastSprint.name, " State:", lastSprint.state);
+                        addIssueToSprint(issue, lastSprint.id);
+                        string[] updateIssues = subtasks(issue);
+                        for (string updateIssue in (updateIssues + issue)) {
+                            refreshIssue(updateIssue);
+                            setPersistentVar(updateIssue, "__sprints__", join(%updateIssue%.sprints_, ","));
+                        }
+                        if (size(updateIssues) == 0)
+                            updateIssues = {issue};
+                        for (string updateIssue in updateIssues) {
+                            updateSprints(updateIssue, {});
+                            if (updateIssue != issue)
+                                updateStartDueDates(updateIssue, false);
+                        }
+                    }
+                }
+            }
+            //
+            integer[] issueSprints = %issue%.sprints_;
+            if (arraySize(issueSprints) > 0) {
+                IdeaDateFields issueDates = getIdeaDateFields(issue);
+                DateRange sprintDates = getSprintDates(issueSprints, issueDates.dateStart.start, issueDates.dateFinish.end, startDueAllSprints);
+                if ((sprintDates.start != issueDates.dateStart.start) or (sprintDates.end != issueDates.dateFinish.end)) {
+                    echo("updateStartDueDates Issue:", issue, " SprintStart:", sprintDates.start, " SprintEnd:", sprintDates.end);
+                    issueDates.dateStart.start = sprintDates.start;
+                    issueDates.dateStart.end = sprintDates.start;
+                    issueDates.dateFinish.start = sprintDates.end;
+                    issueDates.dateFinish.end = sprintDates.end;
+                    setIdeaDateFields(issue, issueDates);
+                }
+            }
+            // update startDate and dueDate (rolldown and rollup)
+            RollupStartDueDates rollup;
+            rollup.startIssue = issue;
+            string[] blockingBlockded;
+            // if rollup did not happen for any rolldown child, then we rollup for this issue
+            boolean completed;
+            for (string linkedIssue in (rolldown + issue)) {
+                try {
+                    if ((linkedIssue != issue) or (!completed))
+                        blockingBlockded += rollupStartDueDates(linkedIssue, rollup, {}).blockingBlocked;
+                    completed = true;
+                } catch string msg {
+                    echo("Exception: ", msg);
+                }
+            }
+            for (string linkedIssue in arrayToSet(blockingBlockded)) {
+                if (!isSessionReplaced(linkedIssue, false, true))
+                    updateDelivery(linkedIssue);
+            }
+        }
+        sysUnlock("queue");
+    }
+    // echo("updateStartDueDates Issue:", issue, " Done");
+}
+
+//------------------------------------------------------------------------------
+// find issue to inherit release date from
+//  - if an issue is directly included in a release it will always inherit release date from that issue
+//  - if an issue has option inheritDelivered and it is included in a feature then it will inherit release date from the feature
+function findInheritedReleaseDate(string issue) {
+    boolean inheritDelivered = arrayElementExists(%issue%.options_, optionInheritDelivered);
+    string inheritFromRelease;
+    string inheritFrom;
+    for (string linkedIssue in getIssuesIncluding(issue)) {
+        string ideaType = %linkedIssue%.ideaType;
+        if (ideaType == ideaTypeRelease) {
+            inheritFromRelease = linkedIssue;
+            break;
+        } else if (inheritDelivered and (ideaType == ideaTypeFeature)) {
+            inheritFrom = linkedIssue;
+        }
+    }
+    return inheritFromRelease != "" ? inheritFromRelease : inheritFrom;
+}
+
+//------------------------------------------------------------------------------
+// update related fields when Date release is update
+//  - if issue is included in a release then revert back to the release date of the release.
+//  - if issue is included in multiple releases then only one release date is used
+//  - update Delivery and Summary fields
+//  - update Release quarter field (add new release quarter option if needed)
+//  - if issue is a release then updaye release dates of ideas included in this release
+//  - if chage.newVal is "inherit" then only update releaseDate if issue inherits release date.
+function dateReleaseChanged(string issue, boolean[] visited, boolean skipUpdateReleaseDates = false) {
+    if (visited[issue]) {
+        echo("dateReleaseChanged: Loop on issue ", issue);
+    } else {
+        // echo("dateReleaseChanged: Issue ", issue);
+        //
+        visited[issue] = true;
+        // if issue is linked to a release, then go back to linked release date
+        string inheritFrom = findInheritedReleaseDate(issue);
+        IdeaDateFields ideaDates = getIdeaDateFields(issue);
+        if (inheritFrom != "") {
+            IdeaDateFields linkedDates = getIdeaDateFields(inheritFrom);
+            if (ideaDates.dateRelease != linkedDates.dateRelease) {
+                ideaDates.dateRelease = linkedDates.dateRelease;
+                setIdeaDateFields(issue, ideaDates);
+            }
+        }
+        DateRange dateRange = ideaDates.dateRelease;
+        date releaseDate = stringToDate(dateRange.start);
+        for (JVersion version in findLinkedVersions(issue)) {
+            if (version.releaseDate != releaseDate) {
+                setPersistentVar(issue, "Ignore_Version_Update_" + version.id, dateRange.start);
+                version.releaseDate = releaseDate;
+                admUpdateProjectVersion(version);
+            }
+        }
+        // update release quarter (may require adding option to release quarters)
+        string rq;
+        if (isNotNull(dateRange)) {
+            string dateYear = substring(dateRange.start, 0, 4);
+            integer dateMonth = substring(dateRange.start, 5, 7);
+            string[] dateQuarters = {"Jan-Mar", "Apr-Jun", "Jul-Sep", "Oct-Dec"};
+            string dateQuarter = dateQuarters[floor((dateMonth - 1) / 3, 1)]; // check that floor works on integer
+            rq = dateQuarter + ", " + dateYear;
+        }
+        if (%issue%.releaseQuarter != rq) {
+            if (rq != "")
+                addFieldOptions(issue, releaseQuarterField, {rq});
+            %issue%.releaseQuarter = rq;
+        }
+        //
+        string ideaType = %issue%.ideaType;
+        for (string linkedIssue in getIssuesIncludedIn(issue)) {
+            string linkedType = %linkedIssue%.ideaType;
+            if (linkedType != "") {
+                boolean inheritRelease = ideaType == ideaTypeRelease;
+                if (!inheritRelease)
+                    inheritRelease = (ideaType == ideaTypeFeature) and arrayElementExists(%linkedIssue%.options_, optionInheritDelivered);
+                if (inheritRelease)
+                    dateReleaseChanged(linkedIssue, visited, true);
+            }
+        }
+        //
+        if (!skipUpdateReleaseDates)
+            updateReleaseDates(issue);
+    }
+    return visited;
+}
+
+//------------------------------------------------------------------------------
+// update field Date release and field Delivery when Release quarter changes
+function releaseQuarterChanged(string issue) {
+    // if issue is linked to a release, then go back to linked release date
+    string inheritFrom = findInheritedReleaseDate(issue);
+    if (inheritFrom != "") {
+        echo("releaseQuarterChanged: ", issue, " release date is inherited!");
+        %issue%.releaseQuarter = %inheritFrom%.releaseQuarter;
+        return;
+    }
+    echo("releaseQuarterChanged: ", issue);
+    //
+    string[] releaseQuarters;
+    releaseQuarters["Jan-Mar"] = "01-01>03-31";
+    releaseQuarters["Apr-Jun"] = "04-01>06-30";
+    releaseQuarters["Jul-Sep"] = "07-01>09-30";
+    releaseQuarters["Oct-Dec"] = "10-01>12-31";
+    string rq = %issue%.releaseQuarter;
+    string releaseQuarter = releaseQuarters[substring(rq, 0, 7)];
+    string releaseYear = substring(rq, 9, 9 + 4);
+    DateRange dateRange;
+    if (isNotNull(releaseQuarter) and isNotNull(releaseYear)) {
+        dateRange.start = releaseYear + "-" + substring(releaseQuarter, 0, 5);
+        dateRange.end = releaseYear + "-" + substring(releaseQuarter, 6, 13);
+    }
+    IdeaDateFields dates = getIdeaDateFields(issue);
+    if ((dates.dateRelease.start != dateRange.start) or (dates.dateRelease.end != dateRange.end)) {
+        echo("releaseQuarterChanged: Update issue:", issue, " (", summary, ") Release start:", dateRange.start, " end:", dateRange.end);
+        dates.dateRelease = dateRange;
+        setIdeaDateFields(issue, dates);
+        dateReleaseChanged(issue, {}); 
+    }
+}
+
+//------------------------------------------------------------------------------
+function docFieldChanged(string issue, string fieldName, string oldValue, string newValue, boolean[] visited) {
+    // echo("docFieldChanged Issue:", issue, " Field:", fieldName, " Old:", oldValue, " New:", newValue);
+    string fieldId = docFields[fieldName];
+    if (arraySize(visited) == 0) {
+        visited[issue] = true;
+        // this is the issue where value was changed
+        newValue = %issue%.%fieldId%;
+        // if value is "." then get value from template
+        if (newValue == "https://template.now") {
+            %issue%.%fieldId% = "";
+            updateTemplates(issue);
+            newValue = %issue%.%fieldId%;
+        // if value is "" then get value from parent or implementedBy
+        } else if (newValue == "") {
+            string _parent = %issue%.parent;
+            if (_parent != "")
+                newValue = %_parent%.%fieldId%;
+            if (newValue == "") {
+                for (string linkedIssue in getIssuesImplementedBy(issue)) {
+                    newValue = %linkedIssue%.%fieldId%;
+                    if (newValue != "")
+                        break;
+                }
+            }
+            if (newValue == "") {
+                for (string linkedIssue in getIssuesIncluding(issue)) {
+                    newValue = %linkedIssue%.%fieldId%;
+                    if (newValue != "")
+                        break;
+                }
+            }
+            if ((newValue != "") and (%issue%.%fieldId% != newValue)) {
+                echo("docFieldChanged issue:", issue, " field:", fieldName, " old:", %issue%.%fieldId%, " new:", newValue);
+                %issue%.%fieldId% = newValue;
+            }
+        }
+        for (string linkedIssue in arrayToSet(getChildrenAndImplementing(issue) + getIssuesIncludedIn(issue)))
+            docFieldChanged(linkedIssue, fieldName, oldValue, newValue, visited);
+    } else if (visited[issue]) {
+        // infinite loop
+        infiniteLoop("docFieldChanged", issue);
+    } else {
+        visited[issue] = true;
+        // update value on linked issues
+        string _current = %issue%.%fieldId%;
+        if ((_current == oldValue) or (_current == "")) {
+            _current = newValue;
+            if (%issue%.%fieldId% != _current) {
+                echo("docFieldChanged issue:", issue, " field:", fieldName, " old:", %issue%.%fieldId%, " new:", newValue);
+                %issue%.%fieldId% = _current;
+                saveModifiedIssuesEx(issue);
+            }
+        }
+        if (_current == newValue) {
+            for (string linkedIssue in arrayToSet(getChildrenAndImplementing(issue) + getIssuesIncludedIn(issue)))
+                docFieldChanged(linkedIssue, fieldName, oldValue, newValue, visited);
+        }
+    }
+    return visited;
+}
+
+//------------------------------------------------------------------------------
+function domainFieldChanged(string issue, string fieldName, string oldValue, string newValue, boolean[] visited) {
+    string fieldId = domainFields[fieldName];
+    if (arraySize(visited) == 0) {
+        // this is the issue where value was changed
+        newValue = join(arraySort(%issue%.%fieldId%, false), ",");
+        // if value is "" then get value from parent or implementedBy
+        if (newValue == "") {
+            string _parent = %issue%.parent;
+            if (_parent != "")
+                newValue = join(arraySort(%_parent%.%fieldId%, false), ",");
+            if (newValue == "") {
+                for (string linkedIssue in getIssuesImplementedBy(issue)) {
+                    newValue = join(arraySort(%linkedIssue%.%fieldId%, false), ",");
+                    if (newValue != "")
+                        break;
+                }
+            }
+            if (newValue == "") {
+                for (string linkedIssue in getIssuesIncluding(issue)) {
+                    newValue = join(arraySort(%linkedIssue%.%fieldId%, false), ",");
+                    if (newValue != "")
+                        break;
+                }
+            }
+            if (newValue != "") {
+                %issue%.%fieldId% = split(newValue, ",");
+                echo("domainFieldChanged Issue:", issue, " ", fieldName, ": ", newValue);
+            }
+        }
+        for (string linkedIssue in arrayToSet(getChildrenAndImplementing(issue) + getIssuesIncludedIn(issue)))
+            domainFieldChanged(linkedIssue, fieldName, oldValue, newValue, visited);
+    } else if (visited[issue]) {
+        // infinite loop
+        infiniteLoop("domainFieldChanged", issue);
+    } else {
+        visited[issue] = true;
+        // update value on linked issues
+        string _current = join(arraySort(%issue%.%fieldId%, false), ",");
+        if ((_current == oldValue) or (_current == "")) {
+            _current = newValue;
+            %issue%.%fieldId% = split(_current, ",");
+            echo("domainFieldChanged Issue:", issue, " ", fieldName, ": ", newValue);
+        }
+        if (_current == newValue) {
+            for (string linkedIssue in arrayToSet(getChildrenAndImplementing(issue) + getIssuesIncludedIn(issue)))
+                domainFieldChanged(linkedIssue, fieldName, oldValue, newValue, visited);
+        }
+    }
+    return visited;
+}
+
+//------------------------------------------------------------------------------
+// update path on issue children (and their children)
+function updateChildPaths(string path, string issue) {
+    // https://appfire.atlassian.net/wiki/spaces/PSJ/pages/15485165/allLinkedIssues
+    // echo("updateChildPaths: Issue:", issue, " Path:", path);
+    for(string child in getChildren(issue)) {
+        // echo("Update path on ", child, "/", %child%.summary, " to ", path);
+        if (%child%.path_ != path) {
+            %child%.path_ = path;
+            SummaryDetails details = parseSummary(%child%.summary, false);
+            updateChildPaths(path + " / " + formatSummary(details, "path"), child);
+        }
+    }
+}
+
+//------------------------------------------------------------------------------
+// virtual event - child added/removed to/from issue.
+function childLinked(string issue, string child, boolean linkAdded) {
+    // echo("childLink issue:", issue, " child: ", child, " linkAdded:", linkAdded);
+}
+
+//------------------------------------------------------------------------------
+// implements link added/removed
+//  - if an issue implements a stage then the issue implements what the stage parent implements
+//  - if an issue implements a feature then the issue implements what the feature implements
+function inheritImplements(string issue, string[] implementedByIssue) {
+    string[] implementIssues;
+    string issueType = %issue%.issueType;
+    if ((issueType == issueTypeFeature) or (issueType == issueTypeStage)) {
+        // update what issues implementing a feature or stage implements
+        for(string linkedIssue in getIssuesImplementing(issue))
+            inheritImplements(linkedIssue, getIssuesImplementedBy(linkedIssue));
+        implementIssues = implementedByIssue;
+    } else {
+        string[] implementStages;
+        string[] implementFeatures;
+        // find features and stages implemnetd by issue
+        for (string linkedIssue in implementedByIssue) {
+            string issueType = %linkedIssue%.issueType;
+            if (issueType == issueTypeStage)
+                implementStages[linkedIssue] = linkedIssue;
+            if (issueType == issueTypeFeature)
+                implementFeatures[linkedIssue] = linkedIssue;
+        }
+        if ((arraySize(implementStages) == 0) and (arraySize(implementFeatures) == 0)) {
+            // no features and stages implemented by issue
+            implementIssues = implementedByIssue;
+        } else {
+            // implement what stage(s) implement
+            for (string linkedStage in implementStages) {
+                string linkedFeature = %linkedStage%.parent;
+                if (linkedFeature != "")
+                    implementIssues += getIssuesImplementedBy(linkedFeature);
+            }
+            // implement what feature(s) implement
+            for (string linkedFeature in implementFeatures)
+                implementIssues += getIssuesImplementedBy(linkedFeature);
+            // all issues that must be implemented
+            implementIssues = arrayToSet(implementIssues + implementStages + implementFeatures);
+            // add links needed
+            for (string linkedIssue in implementIssues) {
+                if (!elementExists(implementedByIssue, linkedIssue))
+                    linkIssue(issue, linkedIssue, linkImplements); // this will create an event
+            }
+            // remove links not needed
+            for (string linkedIssue in implementedByIssue) {
+                if (!elementExists(implementIssues, linkedIssue))
+                    unlinkIssue(issue, linkedIssue, linkImplements); // this will create an event
+            }
+            echo("inheritImplements: issue:", issue, " implements:", implementIssues);
+        }
+    }
+    return implementIssues;
+}
+
+//------------------------------------------------------------------------------
+// implements link added/removed
+//  - 
+function implementsLinked(string issue, string target, boolean linkAdded, boolean updateStartDue = true, boolean updateImplements = false) {
+    echo ("implementsLinked ", issue, " implements ", target, linkAdded ? " added" : " removed", " update implements ", updateImplements);
+    // target is implemented by issue
+    if (target != "") {
+        string[] implements = {};
+        string[] implementsText = {};
+        for (string linkedIssue in getIssuesImplementing(target)) {
+            SummaryDetails details = parseSummary(%linkedIssue%.summary, false);
+            implements = addElementIfNotExist(implements, formatSummary(details, "label"));
+            implementsText = addElementIfNotExist(implementsText, formatSummary(details, "path"));
+        }
+        %target%.deliveredBy_ = implements;
+        %target%.deliveredBy__ = arrayToText("", implementsText);
+        // if an implements link is removed then update start and due dates of implemented issue
+        // if an implements link is added then start and due dates are updated when start and due dates of implementing issue are updated
+        if (updateStartDue and !linkAdded)
+            updateStartDueDates(target, false);
+    }
+    // issue implements target
+    if (issue != "") {
+        string[] implementsIssues = getIssuesImplementedBy(issue);
+        if (updateImplements)
+            implementsIssues = inheritImplements(issue, implementsIssues);
+        string[] implements = {};
+        string[] implementsText = {};
+        for (string linkedIssue in implementsIssues) {
+            SummaryDetails details = parseSummary(%linkedIssue%.summary, false);
+            implements = addElementIfNotExist(implements, formatSummary(details, "label"));
+            implementsText = addElementIfNotExist(implementsText, formatSummary(details, "path"));
+        }
+        %issue%.implements_ = arraySort(implements, false);
+        %issue%.implements__ = arrayToText("", implementsText);
+        if (updateStartDue)
+            updateStartDueDates(issue, false);
+    }
+}
+
+//------------------------------------------------------------------------------
+// parent changed so path on issue and children must be updated
+//.  - when a parent is deleted there is no way to let the children know!
+//.  - when a child is deleted it is possible to let the parent know
+function parentChanged(string issue, string fromParent, string toParent, boolean issueDeleted, boolean parentDeleted) {
+    // create path to this issue
+    // echo("parentChanged ", issue, " parentChanged from ", fromParent, " to ", toParent, " issueDeleted:", issueDeleted, " parentDeleted:", parentDeleted);
+    // string[] children = getChildren(key);
+    // echo("children: ", children);
+    if (!issueDeleted)
+        setPersistentVar(issue, "__parent__", toParent);
+    invalidateChildren(fromParent); // remove children of from parent from cache
+    invalidateChildren(toParent); // remove children of to parent from cache
+    if (!issueDeleted) {
+        // update path and child paths
+        string[] issuePath;
+        for (string issueParent = toParent; issueParent != ""; issueParent = %issueParent%.parent)
+            issuePath = {formatSummary(parseSummary(%issueParent%.summary, false), "path")} + issuePath;
+        issuePath = {getProjectName(%issue%.project)} + issuePath;
+        %issue%.path_ = join(issuePath, " / ");
+        updateChildPaths(join(issuePath + formatSummary(parseSummary(%issue%.summary, false), "path"), " / "), issue);
+        // update start and due dates of new parent(s) if they use roll up
+        // update start and due dates of issue and children if they use roll down
+        implementsLinked(issue, toParent, true);
+        // if a stage gets a new parent, then issues implementing the stage may need to be udated
+        if (%issue%.issueType == issueTypeStage) {
+            for (string linkedIssue in getIssuesImplementing(issue))
+                implementsLinked(linkedIssue, issue, true, false, true);
+        }
+        //
+        for (string fieldName in arrayKeys(docFields)) {
+            string fieldId = docFields[fieldName];
+            if (%issue%.%fieldId% == "")
+                docFieldChanged(issue, fieldName, "", "", {});
+        }
+        for (string fieldName in arrayKeys(domainFields)) {
+            string fieldId = domainFields[fieldName];
+            if (arraySize(%issue%.%fieldId%) == 0)
+                domainFieldChanged(issue, fieldName, "", "", {});
+        }
+    }
+    if (isNotNull(fromParent) and !parentDeleted) {
+        // update implements fields and rollup start and due dates of old parent(s)
+        implementsLinked(null, fromParent, false);
+        // updateStartDueDates(fromParent);
+        childLinked(fromParent, issue, false);
+    }
+    if (isNotNull(toParent)) {
+        childLinked(toParent, issue, true);
+    }
+}
+
+//------------------------------------------------------------------------------
+function convertTeamResponsible(string issue, string[] users) {
+    string[] teamResponsible;
+    try {
+        teamResponsible = fromJson(getPersistentVar(issue, "teamResponsible"));
+    } catch {};
+    setPersistentVar(issue, toJson(teamResponsible - users));
+}
+
+//------------------------------------------------------------------------------
+function updateTeamResponsible(string issue, string[] teamMembers) {
+    string team = getIssueTeamField(issue).id;
+    string[] allResponsible = %issue%.responsible___;
+    string[] teamResponsible;
+    try {
+        teamResponsible = fromJson(getPersistentVar(issue, "teamResponsible"));
+    } catch {};
+    // remove team responsible not present 
+    teamResponsible = arrayIntersect(teamResponsible, allResponsible);
+    // find users that are not team responsible
+    string[] realResponsible = arrayDiff(allResponsible, teamResponsible);
+    //
+    %issue%.responsible___ = arrayToSet(realResponsible + teamMembers);
+    //
+    teamResponsible = arrayDiff(teamMembers, realResponsible);
+    setPersistentVar(issue, "teamResponsible", toJson(teamResponsible));
+    echo("updateTeamMembers Issue:", issue, " Team:", team, " Members:", teamMembers, " Responsible:", realResponsible, " Team Responsible:", teamResponsible);
+}
+
+//------------------------------------------------------------------------------
+function teamChanged(string issue) {
+    invalidateIssueTeamField(issue);
+    string team = getIssueTeamField(issue).id;
+    string[] teamMembers = team == "" ? {} : getTeamMembers(team);
+    echo("teamChanged Issue:", issue, " Team:", team, " Members:", teamMembers);
+    updateTeamResponsible(issue, teamMembers);
+}
+
+//------------------------------------------------------------------------------
+function responsibleChanged(string issue, string oldVal, string newVal) {
+    string[] oldUsers = split(oldVal, ",");
+    string[] newUsers = split(newVal, ",");
+    convertTeamResponsible(issue, arrayDiff(oldUsers, newUsers));
+}
+
+//------------------------------------------------------------------------------
+// assignee changed - updated involved
+function involvedChanged(string issue, string fieldName, string userId) {
+    // echo("assigneeChanged ", issue, " ", change.newValString);
+    if ((userId != "") and !elementExists(automationUsers, userId)) {
+        %issue%.involved___ += userId;
+        if ((fieldName == "assignee") and (%issue%.issueType == issueTypeIdea)) {
+            string issueAssignee = %issue%.assignee;
+            if (issueAssignee != "") {
+                convertTeamResponsible(issue, {issueAssignee});
+                %issue%.responsible___ += issueAssignee;
+            }
+        }
+    }
+}
+
+//------------------------------------------------------------------------------
+// issue commented - update involved
+function issueCommented(string issue, JComment comment) {
+    // JUser user = getUser(comment.author);
+    // echo("issueCommented ", user.displayname);
+    involvedChanged(issue, "comment", comment.author);
+}
+
+//------------------------------------------------------------------------------
+// blocsks link added/removed
+//  - update blocks and blockedBy on issues
+//  - if target was deleted then target is null
+function blocksLinked(string issue, string target, boolean linkAdded) {
+    // echo ("blocksLinked ", issue, "->", target, linkAdded ? " added" : " removed");
+    if (isNotNull(issue))
+        updateDelivery(issue);
+    if (isNotNull(target))
+        updateDelivery(target);
+}
+
+//------------------------------------------------------------------------------
+// related to link added/removed
+//  - update a lot of fields
+function updateRelatedToFields(string issue) {
+    string relatedTo = {};
+    string relatedToText = {};
+    string[] linkedIssues = getIssuesRelatedTo(issue);
+    for (string linkedIssue in linkedIssues) {
+        SummaryDetails details = parseSummary(%linkedIssue%.summary, false);
+        string linkedSummary = formatSummary(details, "path");
+        string linkedLabel = formatSummary(details, "label");
+        string linkedType = %linkedIssue%.ideaType;
+        relatedTo = addToArray(relatedTo, linkedLabel);
+        relatedToText = addToArray(relatedToText, linkedSummary);
+    }
+    string[] labels;
+    string text;
+
+    labels = arraySort(relatedTo, false);
+    text = arrayToText("⮂ " ,relatedToText);
+    if (%issue%.relatedTo_ != labels) %issue%.relatedTo_ = labels;
+    if (%issue%.relatedTo__ != text) %issue%.relatedTo__ = text;
+}
+
+//------------------------------------------------------------------------------
+// related to link added/removed - update a lot of fields
+//   - in some cases the link is reversed so that it makes more sense this tiggers new events
+//   - if target was deleted then target is null
+function relatesLinked(string issue, string target, boolean linkAdded) {
+    // echo ("relatesToLinked ", issue, " relates to ", target, linkAdded ? " added" : " removed");
+    updateRelatedToFields(issue);
+    if (isNotNull(target))
+        updateRelatedToFields(target);
+}
+
+//------------------------------------------------------------------------------
+// find issues including an issue
+//  - if an issue has option inheritIncludes then find all issues that includes the issue
+function findIncluding(string issue, string[] found, boolean[] visited) {
+    if (visited[issue]) {
+        echo("findIncluding: Loop on ", issue);
+    } else {
+        visited[issue] = true;
+        string[] including = getIssuesIncluding(issue);
+        found += including;
+        if (arrayElementExists(%issue%.options_, optionInheritIncludes)) {
+            for (string linkedIssue in including) {
+                found += findIncluding(linkedIssue, found, visited);
+            }
+        }
+    }
+    return arrayToSet(found);
+}
+
+//------------------------------------------------------------------------------
+// update fields showing issues including/included in the issue
+//  - find all issues that includes an issue
+function updateIncludesFields(string issue, string target, boolean[] visited) {
+    if (visited[issue]) {
+        echo("updateIncludesFields: Already visited ", issue, " ", %issue%.summary);
+    } else {
+        // echo("updateIncludesFields: ", issue, " ", %issue%.summary);
+        visited[issue] = true;
+        string[][] includes = {};
+        string[][] includesText = {};
+        string[] including = findIncluding(issue, {}, {}); // parents and their parents
+        string[] includedIn = getIssuesIncludedIn(issue); // children
+        for (string direction in {"including", "includedIn"}) {
+            string[] linkedIssues = direction == "including" ? including : includedIn;
+            for (string linkedIssue in linkedIssues) {
+                SummaryDetails details = parseSummary(%linkedIssue%.summary, false);
+                string linkedSummary = formatSummary(details, "path");
+                string linkedLabel = formatSummary(details, "label");
+                string linkedType = %linkedIssue%.ideaType;
+                if (isNotNull(linkedType)) { 
+                    includes[linkedType] = addToArray(includes[linkedType], linkedLabel);
+                    includesText[linkedType] = addToArray(includesText[linkedType], linkedSummary);
+                }
+                includes[direction] = addToArray(includes[direction], linkedLabel);
+                includesText[direction] = addToArray(includesText[direction], linkedSummary);
+            }
+        }
+        string[] labels;
+        string text;
+    
+        labels = arraySort(includes["including"], false);
+        text = arrayToText("↑ ", includesText["including"]); 
+        if (%issue%.includedIn_ != labels) %issue%.includedIn_ = labels;
+        if (%issue%.includedIn__ != text) %issue%.includedIn__ = text;
+    
+        labels = arraySort(includes["includedIn"], false);
+        text = arrayToText("↓ ",includesText["includedIn"]); 
+        if (%issue%.includes_ != labels) %issue%.includes_ = labels;
+        if (%issue%.includes__ != text) %issue%.includes__ = text;
+    
+        labels = arraySort(includes[ideaTypeIdea], false);
+        text = arrayToText("", includesText[ideaTypeIdea]);
+        if (%issue%.ideas_ != labels) %issue%.ideas_ = labels;
+        if (%issue%.ideas__ != text) %issue%.ideas__ = text;
+    
+        labels = arraySort(includes[ideaTypeStory], false);
+        text = arrayToText("", includesText[ideaTypeStory]);
+        if (%issue%.stories_ != labels) %issue%.stories_ = labels;
+        if (%issue%.stories__ != text) %issue%.stories__ = text;
+    
+        labels = arraySort(includes[ideaTypeFeature], false);
+        text = arrayToText("", includesText[ideaTypeFeature]);
+        if (%issue%.features_ != labels) %issue%.features_ = labels;
+        if (%issue%.features__ != text) %issue%.features__ = text;
+    
+        labels = arraySort(includes[ideaTypeObjective], false);
+        text = arrayToText("", includesText[ideaTypeObjective]);
+        if (%issue%.objectives_ != labels) %issue%.objectives_ = labels;
+        if (%issue%.objectives__ != text) %issue%.objectives__ = text;
+    
+        labels = arraySort(includes[ideaTypeMetric], false);
+        text = arrayToText("", includesText[ideaTypeMetric]);
+        if (%issue%.metrics_ != labels) %issue%.metrics_ = labels;
+        if (%issue%.metrics__ != text) %issue%.metrics__ = text;
+    
+        labels = arraySort(includes[ideaTypeRisk], false);
+        text = arrayToText("", includesText[ideaTypeRisk]);
+        if (%issue%.risks_ != labels) %issue%.risks_ = labels;
+        if (%issue%.risks__ != text) %issue%.risks__ = text;
+    
+        labels = arraySort(includes[ideaTypeOpportunity], false);
+        text = arrayToText("", includesText[ideaTypeOpportunity]);
+        if (%issue%.opportunities_ != labels) %issue%.opportunities_ = labels;
+        if (%issue%.opportunities__ != text) %issue%.opportunities__ = text;
+    
+        labels = arraySort(includes[ideaTypeTheme], false);
+        text = arrayToText("", includesText[ideaTypeTheme]);
+        if (%issue%.themes_ != labels) %issue%.themes_ = labels;
+        if (%issue%.themes__ != text) %issue%.themes__ = text;
+    
+/*
+        labels = arraySort(includes[ideaTypeRelease], false);
+        text = arrayToText("", includesText[ideaTypeRelease]);
+        if (%issue%.releases_ != labels) %issue%.releases_ = labels;
+        if (%issue%.releases__ != text) %issue%.releases__ = text;
+*/    
+        if (target != "-") { // if no target no need to update other issues
+            if (target != "")
+                includedIn = {target}; // if this is the parent issue, then there is no need to update all children
+            for (string linkedIssue in includedIn)
+                visited = updateIncludesFields(linkedIssue, "", visited);
+        }
+    }
+    return visited;
+}
+
+//------------------------------------------------------------------------------
+// includes link added/removed
+//  - if target was deleted then this function is called with identical target and issue
+function includesLinked(string issue, string target, boolean linkAdded) {
+    // echo("includesLinked: ", issue, " includes ", target, linkAdded ? " added" : " removed");
+    boolean reverseLink;
+    string fromType;
+    if (isNotNull(issue)) fromType = %issue%.issueType != issueTypeIdea ? null : %issue%.ideaType;
+    string toType;
+    if (isNotNull(target)) toType = %target%.issueType != issueTypeIdea ? null : %target%.ideaType;
+    // echo ("relatesLink ", issue, "(", fromType, ") -> ", target, "(", toType, ")", linkAdded ? " added" : " removed");
+    if (linkAdded) {
+        string[][] ideaTypeHierarchy; // ideaType a can be parent of ideaTypes {x, y, z}
+        ideaTypeHierarchy[ideaTypeIdea] = {ideaTypeIdea}; // all except ideas are parent to ideas
+        ideaTypeHierarchy[ideaTypeStory] = {ideaTypeIdea}; // all except idea and story are parent to story
+        ideaTypeHierarchy[ideaTypeFeature] = {ideaTypeIdea, ideaTypeStory}; // all except idea, story, feature are parent to feature
+        ideaTypeHierarchy[ideaTypeObjective] = {ideaTypeIdea, ideaTypeStory, ideaTypeFeature, ideaTypeRelease, ideaTypeMetric}; // all except idea, story, feature, objective are parent to objective
+        ideaTypeHierarchy[ideaTypeRelease] = {ideaTypeIdea, ideaTypeStory, ideaTypeFeature};
+        ideaTypeHierarchy[ideaTypeRisk] = {ideaTypeIdea, ideaTypeStory, ideaTypeFeature, ideaTypeObjective, ideaTypeMetric, ideaTypeRelease, ideaTypeOpportunity};
+        ideaTypeHierarchy[ideaTypeOpportunity] = {ideaTypeIdea, ideaTypeStory, ideaTypeFeature, ideaTypeObjective, ideaTypeMetric, ideaTypeRelease, ideaTypeRisk};
+        ideaTypeHierarchy[ideaTypeMetric] = {ideaTypeIdea, ideaTypeStory, ideaTypeFeature};
+        ideaTypeHierarchy[ideaTypeTheme] = {ideaTypeIdea, ideaTypeStory, ideaTypeFeature, ideaTypeObjective, ideaTypeRelease, ideaTypeRisk, ideaTypeOpportunity, ideaTypeMetric};
+        //
+        if (fromType != toType) {
+            if (isNull(fromType) or isNull(toType)) {
+                // reverse other -> idea to idea -> other
+                reverseLink = isNotNull(toType);
+            } else {
+                string[] reverseIfNot = ideaTypeHierarchy[fromType];
+                if (isNull(reverseIfNot)) {
+                    echo("!Unexpected ideaType ", fromType);
+                } else {
+                    reverseLink = !arrayElementExists(reverseIfNot, toType);
+                }
+            }
+            if (reverseLink) {
+                // reverse the link - this will create two new events!
+                echo ("Reverse link ", target, "(", toType, ") -> ", issue, "(", fromType, ")");
+                unlinkIssue(issue, target, linkIncludes); // creates new events
+                linkIssue(target, issue, linkIncludes); // creates new event
+                if (false) { // TODO: is this really needed?
+                    saveModifiedIssues();
+                    refreshIssue(issue);
+                    if (target != "")
+                        refreshIssue(target);
+                }
+            }
+        }
+    }    
+    if (!reverseLink) {
+        updateIncludesFields(issue, isNull(target) ? "-" : target, {});
+        // update release dates on ideas included in a release
+        if (linkAdded and (%issue%.ideaType == ideaTypeRelease)) {
+            dateReleaseChanged(issue, {}); // do not update release quarter
+        }
+    }
+}
+
+//------------------------------------------------------------------------------
+// duplicates linked
+//  - If source is an idea and target is not an idea then set source status to "IS SUPPORT"
+//  - If source is not and idea and target is an idea then set source status to "IS IDEA"
+//  - Else set status to "IS DUPLICATE"
+function duplicatesLinked(string issue, string target, boolean linkAdded) {
+    echo ("duplicatesLinked ", issue, " duplicates ", target, linkAdded ? " added" : " removed");
+    boolean sourceIsIdea = %issue%.issueType == issueTypeIdea; // isDuplicated
+    boolean targetIsIdea = %target%.issueType == issueTypeIdea; // isDuplicate
+    if (sourceIsIdea and !targetIsIdea) {
+        setIssueStatusField(issue, "IS SUPPORT");
+    } else if (!sourceIsIdea and targetIsIdea) {
+        setIssueStatusField(issue, "IS IDEA");
+    } else {
+        setIssueStatusField(target, "IS DUPLICATE");
+    }
+}
+
+//------------------------------------------------------------------------------
+// update summary on child and implements issues
+// handle this case:
+//   issue A is renamed
+//   issue B delivers issue A
+//   issue C delivers issue A and B (so B must be updated before C)
+function updateImplementsSummary(string issue, string oldSummary, string newSummary, string[] implementedBy, string[] visited) {
+    echo("updateImplementsSummary issue:", issue, " (", %issue%.summary, ")");
+    // breakInfiniteLoop();
+    // updated issues that implement this issue (implementedBy = issues implementing this issue)
+    for (string update in implementedBy) {
+        // check if issue is already done, or if there is a loop
+        switch (visited[update]) {
+            case "notify" :
+            case "done" :
+                // echo("updateImplementsSummary: Done:", update, " (", %update%.summary, ")");
+                continue;
+            case "doing" : {
+                infiniteLoop("updateImplementsSummary", update);
+                continue;
+            }
+        }
+        // mark issue, so that loops can be detected
+        echo("updateImplementsSummary updateIssue:", update, " (", %update%.summary, ")");
+        visited[update] = "doing";
+        // find issues implemeted by issue to be updated
+        string[] updateImplements = getIssuesImplementedBy(update);
+        for (string updateImplement in updateImplements) {
+            // if issue implements other issues then it must be updated first
+            if (updateImplement != issue) {
+                // if issue is already updated, then this function do nothing
+                echo("updateImplementsSummary Dependency from ", update, " to ", updateImplement);
+                visited = updateImplementsSummary(update, oldSummary, newSummary, {updateImplement}, visited);
+            }
+        }        
+        // all dependent issues now updated. this issue can be updated.
+        // mark issue as done (may be changed to notify later)
+        visited[update] = "done";
+        //
+        SummaryDetails details = parseSummary(%update%.summary, false);
+        string updatedSummary = replace(" + " + details.summary + " + ", " + " + oldSummary + " + ", " + " + newSummary + " + ");
+        if (updatedSummary != " + " + details.summary + " + ") {
+            updatedSummary = substring(updatedSummary, 3, length(updatedSummary) - 3);
+            details.summary = defaultSummary(updateImplements, updatedSummary);   
+            updatedSummary = formatSummary(details, "summary", update);
+            echo("updateImplementsSummary renameIssue:", update, " oldSummary:", details.current, " newSummary:", updatedSummary);
+            if (details.current != updatedSummary) {
+                string[] issuePath;
+                for (string issueParent = %issue%.parent; issueParent != ""; issueParent = %issueParent%.parent)
+                    issuePath = {formatSummary(parseSummary(%issueParent%.summary, false), "path")} + issuePath;
+                issuePath = {getProjectName(%issue%.project)} + issuePath;
+                updateChildPaths(join(issuePath + formatSummary(details, "path"), " / "), update);
+                visited[update] = "notify";
+                // visited = updateImplementsSummary(update, oldSummary, newSummary, getIssuesImplementing(update), visited);
+            }
+        }
+    }
+    return visited;
+}
+
+//------------------------------------------------------------------------------
+// summary changed 
+//   - uses change.newVal and change.oldVal
+//   - if summary is "." then updates summary to parent/implements summary
+//.  - if summary includes an idea tyoe and no idea type exists in issue then update idea type
+//   - updates path on child and implements issues
+//   - updates summary of implements issues (if their summary matched old summary)
+function summaryChanged(string issue, string oldSummary, boolean updateTypeOrTemplates = true) {
+    // echo("summaryChanged Issue:", issue, " From:'", change.oldVal, "' To:'", change.newVal, "'");
+    string[] implements = getIssuesImplementedBy(issue); // do not add parent here (see further down)
+    string[] implemented = getIssuesImplementing(issue);
+    string newSummary = %issue%.summary;
+    SummaryDetails details = parseSummary(%issue%.delivered_, true);
+    SummaryDetails summaryDetails = parseSummary(newSummary, false);
+    details = combineSummary(details, summaryDetails);
+    details.type = summaryDetails.type;
+    // if ideaType is void and summary contains idea type then update ideaType
+    if (%issue%.issueType != issueTypeIdea) {
+        details.type = "";
+    } else {
+        string _type = %issue%.ideaType;
+        if (isNotNull(_type)) {
+            details.type = ideaTypes[_type];
+        } else {
+            _type = arrayGetKey(ideaTypes, details.type);
+            if (!updateTypeOrTemplates) {
+                echo("summaryChange: Idea has no type, but it will not be fixed now.");
+            } else {
+                _type = details.type == "" ? ideaTypeIdea : arrayGetKey(ideaTypes, details.type);
+                echo("summaryChanged: Set ideaType to ", _type);
+                %issue%.ideaType = _type;
+                updateTemplates(issue);
+                // saveModifiedIssues(); // see ideaTypeChanged
+                details.type = ideaTypes[_type];
+            }
+        }
+    }
+    // update summay if needed
+    details.implements = arraySize(implements) != 0;
+    details.implemented = arraySize(implemented) != 0;
+    if (details.summary == ".")
+        details.summary = defaultSummary(implements, details.summary);
+    formatSummary(details, "delivered", issue);
+    newSummary = formatSummary(details, "summary", issue);
+    //
+    string newName = formatSummary(details, "path");
+    string oldName = formatSummary(parseSummary(oldSummary, false), "path");
+    // update related issues
+    if ((newSummary != oldSummary) or (newSummary != summaryDetails.current)) {
+        // update path of children
+        string[] issuePath;
+        for (string issueParent = %issue%.parent; issueParent != ""; issueParent = %issueParent%.parent)
+            issuePath = {formatSummary(parseSummary(%issueParent%.summary, false), "path")} + issuePath;
+        issuePath = {getProjectName(%issue%.project)} + issuePath;
+        updateChildPaths(join(issuePath + formatSummary(details, "path"), " / "), issue);
+        // update summary on implements issues
+        string[] visited;
+        visited[issue] = "notify";
+        visited = updateImplementsSummary(issue, parseSummary(oldSummary, false).summary, details.summary, implemented, visited);
+        for (string notifyIssue in arrayKeys(visited)) {
+            if (visited[notifyIssue] == "notify") {
+                // update summary in related issues
+                for (string linkedIssue in implemented)
+                    implementsLinked(linkedIssue, issue, true);
+                for (string linkedIssue in implements)
+                    implementsLinked(issue, linkedIssue, true);
+                // note that calling linkIncludes may change link direction
+                for (string linkedIssue in getIssuesIncluding(issue))
+                    includesLinked(linkedIssue, issue, true);
+                for (string linkedIssue in getIssuesIncludedIn(issue))
+                    includesLinked(issue, linkedIssue, true);
+                // 
+                for (string linkedIssue in arrayToSet(getAllLinkedIssues(issue, linkRelates, 1)))
+                    relatesLinked(issue, linkedIssue, true);
+                for (string linkedIssue in arrayToSet(getAllLinkedIssues(issue, linkRelates, -1)))
+                    relatesLinked(linkedIssue, issue, true);
+            }
+        }
+    }
+}
+
+//------------------------------------------------------------------------------
+function descriptionChanged(string issue) {
+    string newVal = trim(%issue%.description);
+    if (newVal != ".") {
+        echo("descriptionChanged: Issue:", issue, " Description:\n", chop(newVal, 1024));
+    } else {
+        string _issueType = %issue%.issueType;
+        string template;
+        if (_issueType == issueTypeIdea)
+            template = ideaTemplates[%issue%.ideaType];
+        else if (_issueType == issueTypeStage)
+            template = stageTemplates[%issue%.summary];
+        else
+            template = issueTemplates[_issueType];
+        if (template == "")
+            template = "There is no template for issue " + issue + ".";
+        %issue%.description = template;
+    }
+}
+
+//------------------------------------------------------------------------------
+function shortDescriptionChanged(string issue) {
+    string newVal = trim(%issue%.shortDescription);
+    if (newVal != ".") {
+        echo("shortDescriptionChanged: Issue:", issue, " Short description:\n", newVal);
+    } else {
+        string _issueType = %issue%.issueType;
+        string template;
+        if (_issueType == issueTypeIdea)
+            template = ideaShortTemplates[%issue%.ideaType];
+        if (template == "")
+            template = "There is no template for issue " + issue + ".";
+        %issue%.shortDescription = template;
+    }
+}
+
+//------------------------------------------------------------------------------
+function tagsChanged(string issue) {
+    string[] _tags = %issue%.tags;
+    string[] _labels = %issue%.labels;
+    boolean hasCommittedPromoted = arrayElementExists(_labels, "Committed_Promoted");
+    if (arrayElementExists(_tags, tagCommitted) and arrayElementExists(_tags, tagPromoted)) {
+        if (!hasCommittedPromoted)
+            %issue%.labels += "Committed_Promoted";
+    } else {
+        if (hasCommittedPromoted)
+            %issue%.labels -= "Committed_Promoted";
+    }
+}
+
+//------------------------------------------------------------------------------
+// update status alerts on issue and all parents
+function updateIssueStatusAlerts(string issue, string issueStatus) {
+    // echo("updateIssueStatusAlerts: Issue:", issue);
+    // update status alerts on children
+    //  -note that children may have multiple parents!
+    string[] children = getChildrenAndImplementing(issue);
+    boolean hasChildren = arraySize(children) > 0;
+    boolean allChildrenClosed = true;
+    boolean allChildrenOpen = true;
+    boolean childDoing = false;
+    for (string childIssue in children) {
+        string childStatus = getIssueStatusCategory(childIssue);
+        if (childStatus != statusCategoryClosed) {
+            allChildrenClosed = false;
+            if (childStatus == statusCategoryOpen)
+                childDoing = true;
+        } else {
+            allChildrenOpen = false;
+        }
+        boolean openParents = false;
+        boolean closedParents = false;
+        for (string parentIssue in getParentAndImplementedBy(childIssue)) {
+            string parentStatus = getIssueStatusCategory(parentIssue);
+            if (parentStatus == statusCategoryClosed) {
+                closedParents = true;
+            } else {
+                openParents = true;
+            }
+        }
+        boolean[] alerts = setAlert({}, alertClosedParent, closedParents and (childStatus != statusCategoryClosed));
+        updateAlerts(childIssue, alerts, true);
+    }
+
+    // update status alerts on parents
+    //  -note that there may be multiple parents!
+    string[] parents = getParentAndImplementedBy(issue);
+    boolean hasParents = arraySize(parents) > 0;
+    boolean openParents = false;
+    boolean closedParents = false;
+    for (string parentIssue in parents) {
+        string parentStatus = getIssueStatusCategory(parentIssue);
+        if (parentStatus == statusCategoryClosed) {
+            closedParents = true;
+        } else {
+            openParents = true;
+        }
+        string[] children = getChildrenAndImplementing(parentIssue);
+        boolean allChildrenClosed = true;
+        boolean allChildrenOpen = true;
+        boolean childDoing = false;
+        for (string childIssue in children) {
+            string childStatus = getIssueStatusCategory(childIssue);
+            if (childStatus != statusCategoryClosed) {
+                allChildrenClosed = false;
+                if (childStatus == statusCategoryOpen)
+                    childDoing = true;
+            } else {
+                allChildrenOpen = false;
+            }
+        }
+        boolean[] alerts = {};
+        alerts = setAlert(alerts, alertOpenChildren, !allChildrenClosed and (parentStatus == statusCategoryClosed));
+        alerts = setAlert(alerts, alertAllChildrenClosed, allChildrenClosed and (parentStatus != statusCategoryClosed));
+        alerts = setAlert(alerts, alertNoChildrenDoing, !childDoing and (parentStatus == statusCategoryOpen));
+        alerts = updateAlerts(parentIssue, alerts, true);
+    }
+    
+    // update status alerts on issue
+    boolean[] alerts = {};
+    alerts = setAlert(alerts, alertOpenChildren, hasChildren and !allChildrenClosed and (issueStatus == statusCategoryClosed));
+    alerts = setAlert(alerts, alertAllChildrenClosed, hasChildren and allChildrenClosed and (issueStatus != statusCategoryClosed));
+    alerts = setAlert(alerts, alertNoChildrenDoing, hasChildren and !childDoing and (issueStatus == statusCategoryOpen));
+    alerts = setAlert(alerts, alertClosedParent, hasParents and closedParents and (issueStatus != statusCategoryClosed));
+    alerts = updateAlerts(issue, alerts, true);
+}
+
+//------------------------------------------------------------------------------
+// stage changed
+//  - this function needs to call statusChanged which is declared after this function. therefore this function returns a change object.
+function stageChanged(string issue, boolean[] visited) {
+    echo("stageChanged: Issue:", issue);
+    if (visited[issue]) {
+        infiniteLoop("stageChanged", issue);
+    } else {
+        visited[issue] = true;
+        // if issueType is stage, then update stage template
+        if (%issue%.issueType == issueTypeStage)
+            updateTemplates(issue);
+        // update stage on implemented related issues
+        string newStage = %issue%.stage;
+        for (string linkedIssue in arrayToSet(getIssuesImplementedBy(issue) + getIssuesImplementing(issue))) {
+            if (%linkedIssue%.stage != newStage) {
+                %linkedIssue%.stage = newStage;
+                stageChanged(linkedIssue, visited);
+            }
+        }
+    }
+}
+
+//------------------------------------------------------------------------------
+// status changed
+//   - call sysLock("queue") before calling this function
+function statusChanged(string issue, boolean[] visited) {
+    // echo("statusChanged: Issue:", issue);
+    if (visited[issue]) {
+        infiniteLoop("statusChanged", issue);
+    } else {
+        visited[issue] = true;
+        // update delivery and blocked issues if status category has changed
+        string[] update = {issue};
+        update += getIssuesBlockedBy(issue);
+        update += getIssuesBlocking(issue);
+        for (string linkedIssue in arrayToSet(update))
+            updateDelivery(linkedIssue);
+        // update staus on linked features
+        IssueStatusField newStatus = getIssueStatusField(issue);
+        for (string linkedIssue in arrayToSet(getIssuesImplementing(issue) + getIssuesImplementedBy(issue))) {
+            IssueStatusField linkedStatus = getIssueStatusField(linkedIssue);
+            if (linkedStatus.name != newStatus.name) {
+                echo("statusChanged: Issue:", issue, " Status: ", newStatus.name, " LinkedIssue:", linkedIssue, " LinkedStatus:", linkedStatus.name);
+                setIssueStatusField(linkedIssue, newStatus.name);
+                statusChanged(linkedIssue, visited);
+            }
+        }
+        //
+        updateIssueStatusAlerts(issue, newStatus.statusCategory.key);
+    }
+}
+
+//------------------------------------------------------------------------------
+// ideaType changed
+//  - update summary
+//  - update description (only if description is empty or a unmodified template)
+//  - update confluenceLink (only if link is empty or a unmodified template)
+//  - update filesLink (only if link is empty or a unmodified template)
+function ideaTypeChanged(string issue, string oldVal, string newVal) {
+    // idea type is set to Idea in issueCreated, so we need to set it back to to correct value...
+    if (isNull(oldVal)) {
+        echo("ideaTypeChanged: Set ideaType back to ", newVal);
+        // TODO: consider using refreshIssue(issue) here!
+        %issue%.ideaType = null; // needed to get the new value saved
+        saveModifiedIssues(); // needed to get the new value saved
+        %issue%.ideaType = newVal;  // needed to get the new value saved
+    }
+    //
+    updateTemplates(issue);
+    //
+    summaryChanged(issue, %issue%.summary); // summary change will updated linked issues!
+}
+
+//------------------------------------------------------------------------------
+// !"#$%&'()*+,-./    
+function rankChanged(string issue) {
+    if (true) {
+        string s = %issue%.rank;
+        s = matchReplace(s, "([0-9])", "a$1");
+        s = matchReplace(s, "([a-z])", "b$1");
+        s = replace(s, "0", "a");
+        s = replace(s, "1", "b");
+        s = replace(s, "2", "c");
+        s = replace(s, "3", "d");
+        s = replace(s, "4", "e");
+        s = replace(s, "5", "f");
+        s = replace(s, "6", "g");
+        s = replace(s, "7", "h");
+        s = replace(s, "8", "i");
+        s = replace(s, "9", "j");
+        s = replace(s, "|", "ca");
+        s = replace(s, ":", "cb");
+        %issue%.rank_ = s;
+    }
+}
+
+//------------------------------------------------------------------------------
+// delete issue and all child issues
+//  - when issues are deleted linked issues must be updated.
+//  - only linked issues that are also not deleted needs to be updated.
+struct DeletedIssueLink {
+    string source;
+    string target;
+    string name;
+}
+function _deleteIssueAndChildren(string issue) {
+    invalidateChildren(issue);
+    for (string child in getChildren(issue))
+        _deleteIssueAndChildren(child);
+    try {
+        // echo("deleteIssueAndChildren: Delete ", issue);
+        deleteIssue(issue);
+    } catch {
+        echo("deleteIssueAndChildren: Delete Exception ", issue);
+    }
+}
+function deleteIssueAndChildren(string[] issues) {
+    sysLock("queue");
+    // find all issue children (and their children)
+    string[] deleteIssues;
+    string[] parentIssues;
+    for (string issue in issues) {
+        parentIssues += %issue%.parent;
+        deleteIssues += getChildren(issue, true) + issue;
+    }
+    deleteIssues = arrayToSet(deleteIssues);
+    // find all issues that needs to be updated (linked issues that are not deleted)
+    DeletedIssueLink[] notifyIssues;
+    for (string deleteIssue in deleteIssues) {
+        for (JIssueLink issueLink in getIssueLinksDetail(deleteIssue)) {
+            // remember all issues affected by deleted issues
+            if (!arrayElementExists(deleteIssues, issueLink.issue)) {
+                DeletedIssueLink link;
+                if (issueLink.direction == 1) {
+                    link.source = "";
+                    link.target = issueLink.issue;
+                } else {
+                    link.source = issueLink.issue;
+                    link.target = "";
+                }
+                link.name = issueLink.name;
+                // only update each link once
+                notifyIssues[link.source + ":" + link.target + ":" + link.name] = link;
+            }
+        }
+    }
+    // delete all issues
+    saveModifiedIssues();
+    for (string issue in issues)
+        _deleteIssueAndChildren(issue);
+    // notify affected issues (TODO check this!)
+    for (DeletedIssueLink link in notifyIssues) {
+        if (link.name == linkBlocks) {
+            blocksLinked(link.source, link.target, false);
+        } else if (link.name == linkRelates) {
+            relatesLinked(link.source, link.target, false);
+        } else if (link.name == linkImplements) {
+            implementsLinked(link.source, link.target, false);
+        } else if (link.name == linkIncludes) {
+            includesLinked(link.source, link.target, false);
+        };
+    }
+    saveModifiedIssues();
+    // simulate issue deleted event (only needed for top level issue)
+    for (string issueParent in arrayToSet(parentIssues)) {
+        if (issueParent != "")
+            parentChanged("", issueParent, null, true, false);
+    }
+    sysUnlock("queue");
+}
+
+//------------------------------------------------------------------------------
+function cloneIssueAndChildren(string oldIssue, string[][] oldChildren, string newParent, string newProject, string[] newIssues, string prefix) {
+    string summary = %oldIssue%.summary;
+    if (prefix != "") {
+        SummaryDetails summaryDetails = parseSummary(summary, false);
+        summaryDetails.summary = prefix + summaryDetails.summary;
+        summary = formatSummary(summaryDetails, "summary");
+    }
+    string newIssue = createIssueRaw(newProject, newParent, %oldIssue%.issueType, summary, "");
+    newIssues[oldIssue] = newIssue;
+    for (string oldChild in oldChildren[oldIssue])
+        newIssues = cloneIssueAndChildren(oldChild, oldChildren, newIssue, newProject, newIssues, prefix);
+    return newIssues;
+}
+function cloneProjects(string[] toProjects) {
+    sysLock("queue");
+    saveModifiedIssues();
+    // delete old issues
+    echo("cloneProjects: Delete issues");
+    {
+        string[] deleteRoots;
+        for (string toProject in arrayKeys(toProjects))
+            deleteRoots += selectIssues("project = " + toProject + " and parent = EMPTY", 10000);
+        deleteIssueAndChildren(deleteRoots);
+    }
+    integer[] openSprints;
+    integer[] closedSprints;
+    integer[] sprintBoards;
+    // for each project
+    for (string toProject in arrayKeys(toProjects)) {
+        string fromProject = toProjects[toProject];
+        // delete old versions
+        echo("cloneProjects: Delete versions");
+        for (JVersion oldVersion in getProjectVersionsEx(toProject)) {
+            admDeleteProjectVersion(toProject, oldVersion.name);
+        }
+        // create new versions
+        echo("cloneProjects: Create versions");
+        for (JVersion oldVersion in getProjectVersionsEx(fromProject)) {
+            admAddProjectVersion(toProject, oldVersion.name, "", oldVersion.releaseDate);
+        }
+        // delete old sprints
+        echo("cloneProjects: Delete sprints");
+        ProjectSprints toSprints = getProjectSprints(toProject);
+        sprintBoards[toProject] = toSprints.boards[0].id;
+        for (JSprint sprint in (toSprints.openSprints + toSprints.closedSprints)) {
+            // echo("Delete: ", sprint.name);
+            deleteSprint(sprint.id);
+        }
+        // create new sprints
+        echo("cloneProjects: Create sprints");
+        ProjectSprints fromSprints = getProjectSprints(fromProject);
+        for (JSprint sprint in fromSprints.openSprints) {
+            integer newSprint = createSprint(toSprints.boards[0].id, sprint.name, sprint.goal, sprint.startDate, sprint.endDate);
+            openSprints["_" + sprint.id] = newSprint;
+        }
+        for (JSprint sprint in fromSprints.closedSprints) {
+            integer newSprint = createSprint(toSprints.boards[0].id, sprint.name, sprint.goal, sprint.startDate, sprint.endDate);
+            closedSprints["_" + sprint.id] = newSprint;
+        }
+    }
+    // create issues
+    echo("cloneProjects: Create issues");
+    string[][] issueClonedSprints;
+    string[][] issueOtherSprints;
+    string[] clones = {"A-", "B-", "C-", "D-", "E-", "F-"};
+    for (string prefix in clones) {
+        string[] newIssues;
+        for (string toProject in arrayKeys(toProjects)) {
+            string fromProject = toProjects[toProject];
+            // in order to get correct sorting of cloned issues , they need
+            // to be created in the correct order. get issues ordered by rank,
+            // and then create new issues in that order.
+            string[] oldIssues = selectIssues("project = " + fromProject + " order by Rank", 10000);
+            string[][] oldChildren;
+            for (string oldIssue in oldIssues) {
+                string oldParent = %oldIssue%.parent;
+                if (oldParent == "") oldParent = "root";
+                oldChildren[oldParent] += oldIssue;
+            }
+            for (string oldIssue in oldChildren["root"])
+                newIssues = cloneIssueAndChildren(oldIssue, oldChildren, "", toProject, newIssues, prefix);
+            // there needs to be a delay from issue is created to issue fields are updated,
+            // so issues are created first and fields are updated later.
+            sysSleep(2000);
+            //
+            const string[] skip = {
+                "summary", "created", "status", "project", "watchers",
+                "key", "id", "updated", "issueType",
+                "customfield_10019", // Rank
+                "customfield_10134", // dateFinish
+                "customfield_10133", // dateRelease
+                "customfield_10132" // dateStart
+            };
+            for (string oldIssue in arrayKeys(newIssues)) {
+                string[] oldFields = getIssueFields(oldIssue, false);
+                string newIssue = newIssues[oldIssue];
+                for (string name in arrayKeys(oldFields)) {
+                    switch (name) {
+                        case "parent" :
+                            setPersistentVar(newIssue, "__parent__", %newIssue%.parent);
+                            break;
+                        case "customfield_10020" :
+                            integer[] oldIssueSprints = oldFields[name];
+                            // echo("Sprints: ", oldIssueSprints);
+                            for (integer oldSprint in oldIssueSprints) {
+                                string oldSprintKey = "_" + oldSprint;
+                                if (isNull(openSprints[oldSprintKey]) and isNull(closedSprints[oldSprintKey])) {
+                                    // sprint was cloned
+                                    issueOtherSprints[oldSprintKey] += newIssue;
+                                } else {
+                                    // sprint belongs to project not cloned
+                                    issueClonedSprints[oldSprintKey] += newIssue;
+                                }
+                            }
+                            break;                        
+                        default :
+                            if (!arrayElementExists(skip, name))
+                                %newIssue%.%name% = oldFields[name];
+                    }
+                }
+                setIssueStatusField(newIssue, getIssueStatusField(oldIssue).name);
+                saveModifiedIssuesEx(newIssue);
+            }
+        }
+        saveModifiedIssuesEx();
+        // create links
+        if (true) {
+            echo ("Create links");
+            boolean[] newLinks;
+            for (string oldIssue in arrayKeys(newIssues)) {
+                string newIssue = newIssues[oldIssue];
+                JIssueLink[] oldLinks = getIssueLinksDetail(oldIssue);
+                for(JIssueLink oldLink in oldLinks){
+                    string name = newIssue + ":" + oldLink.name + ":" + oldLink.direction;
+                    if (newLinks[name])
+                        continue;
+                    newLinks[name] = true;
+                    string fromLink = newIssue;
+                    string toLink = newIssues[oldLink.issue];
+                    if (toLink == "") {
+                        toLink = oldLink.issue;
+                    } else {
+                        newLinks[toLink + ":" + oldLink.name + ":" + (oldLink.direction * -1)] = true;
+                    }
+                    if (oldLink.direction == -1) {
+                        fromLink = toLink;
+                        toLink = newIssue;
+                    }
+                    echo("Link ", fromLink, " to ", toLink, " like type ", oldLink.name);
+                    // this will create an event!
+                    linkIssue(fromLink, toLink, oldLink.name);
+                    saveModifiedIssuesEx(newIssue);
+                }
+            }
+            saveModifiedIssuesEx();
+        }
+    }
+    // add sprints to issues
+    string[][] issueSprints;
+    for (string oldSprint in arrayKeys(closedSprints)) {
+        integer newSprint = closedSprints[oldSprint];
+        string[] issues = issueClonedSprints[oldSprint];
+        for (string issue in issues) {
+            addIssueToSprint(issue, newSprint);
+            issueSprints[issue] += newSprint;
+        }
+        startSprint(newSprint);
+        closeSprint(newSprint);
+    }    
+    for (string oldSprint in arrayKeys(openSprints)) {
+        string[] issues = issueClonedSprints[oldSprint];
+        integer newSprint = openSprints[oldSprint];
+        for (string issue in issues) {
+            addIssueToSprint(issue, newSprint);
+            issueSprints[issue] += newSprint;
+        }
+    }    
+    for (string oldSprint in arrayKeys(issueOtherSprints)) {
+        integer otherSprint = chop(oldSprint, -1);
+        string[] info = sprintInfo(otherSprint);
+        if (info["id"] != otherSprint) {
+            echo("Failed to get sprintInfo for sprint ", otherSprint);
+        } else {
+            string[] issues = issueOtherSprints[otherSprint];
+            for (string issue in issues) {
+                addIssueToSprint(issue, otherSprint);
+                issueSprints[issue] += otherSprint;
+            }
+        }
+    }
+    for (string issue in arrayKeys(issueSprints)) {
+        setPersistentVar(issue, "__sprints__", join(issueSprints[issue], ","));
+    }
+    echo("--------------------------------------------------------------------------------");
+    echo("--- Clone Done -----------------------------------------------------------------");
+    echo("--------------------------------------------------------------------------------");
+    sysUnlock("queue");
+}
+
+//------------------------------------------------------------------------------
+// issue was created
+//  - parent changed event happens in parallel to this event
+//  - rank changed event happens in parallel to this event
+//  - call sysLock("queue") before calling this function
+function issueCreated(string issue) {
+    // check if issue is cloned (needs to wait some time before checking)
+    setPersistentVar(issue, "NOT_CLONED", "true");
+    setPersistentVar(issue, "TYPE_NOT_SET", "true");
+    sysSleep(2000); // wait for fields to be set when cloning or type is set
+    boolean cloned = isNull(getPersistentVar(issue, "NOT_CLONED"));
+    boolean hasType = isNull(getPersistentVar(issue, "TYPE_NOT_SET"));
+    //
+    echo("issueCreated Issue:", issue, " Issue type:", %issue%.issueType, " Cloned:", cloned, " HasType:", hasType);
+    // convert email request to request issues (since it is annoing to mange two request types)
+    string issueType = %issue%.issueType;
+    if (issueType == issueTypeEmailRequest) {
+        issueType = issueTypeRequest;
+        string requestId = issueTypeIdForProject(%issue%.project, issueTypeRequest);
+        setIssueType(issue, requestId);
+    }
+    // setup default options
+    if (!cloned) {
+        %issue%.options_ = {optionRollupStart, optionRollupDue, optionInheritIncludes};
+    }
+    // trigger summary changed event (needs to do this now, otherwise ideaType is not set brack to original value)
+    summaryChanged(issue, "", !hasType);
+    // summary changed only updates description templates of ideas, so we do the other here
+    if (issueType != issueTypeIdea) 
+        updateTemplates(issue);
+    // trigger assignee changed event
+    string issueAssignee = %issue%.assignee;
+    if (isNotNull(issueAssignee))
+        involvedChanged(issue, "assignee", issueAssignee);
+    // trigger reporter changed event (change.newVal also used further down)
+    string issueReporter = %issue%.reporter;
+    if (isNotNull(issueReporter))
+        involvedChanged(issue, "reporter", issueReporter);
+    // parent is only set if issue is created from SIL
+    string issueParent = %issue%.parent;
+    if (%issue%.parent != "")
+        parentChanged(issue, "", issueParent, false, false);
+    // create stage issues when a feature is created
+    if (issueType == issueTypeFeature) {
+        string projectKey = %issue%.project;
+        for (string stage in createStages) {
+            // create issue for each stage
+            string name = chop(stage, 1) + toLower(substring(stage, 1, -1));
+            string newIssue = createIssueRaw(projectKey, issue, issueTypeStage, name, "");
+            sysSleep(2000);
+            %newIssue%.description = stageTemplates[stage];
+            %newIssue%.stage = stage;
+            %newIssue%.reporter = issueReporter;
+            %newIssue%.involved___ += issueReporter;
+            // trigger issue created event
+            issueCreated(newIssue);
+        }
+    }
+    if (false and (issueType == issueTypeFeedback)) {
+        // this is done by Jira automtion, so that descriptions with images are supported
+        string newIssue = createIssueRaw("DI", null, issueTypeIdea, %issue%.summary, "");
+        sysSleep(2000);
+        %newIssue%.description = %issue%.description; // fails if description includes images
+        // %newIssue%.attachments = %issue%.attachments;
+        linkIssue(newIssue, issue, linkIncludes);
+    }
+}
+
+//------------------------------------------------------------------------------
+// issue was deleted
+//   - notify children that parent was deleted
+//   - notify parent than child was deleted
+function issueDeleted(string issue) {
+    // notify parent that child has been deleted
+    parentChanged(issue, %issue%.parent, null, true, false);
+    // find children who lost their parent and notify them (a bug in jira cause children not to be notifed when a parent is deleted)
+    string[] children = selectIssues("issueParent = " + issue, 10000);
+    // notify children that parent has been deleted
+    for (string child in children)
+        if ((child != issue) and isNull(%child%.parent)) parentChanged(child, issue, null, false, true);
+}
+
+//------------------------------------------------------------------------------
+// Version Events
+//------------------------------------------------------------------------------
+
+//------------------------------------------------------------------------------
+function versionChanged(string issue) {
+    echo("versionChanged: Issue:", issue);
+    updateReleaseDates(issue);
+}
+
+//------------------------------------------------------------------------------
+function versionUpdated(JVersion version) {
+    // echo("versionUpdated: Version:", version);
+    //
+    // sysLock("queue"); // TODO Is this needed?
+    invalidateVersion(version);
+    VersionDetails details = getVersionDetails(version.id);
+    string[] updateIssues;
+    for (string issue in details.relatedIssues) {
+        if (issueExists(issue)) try {
+            echo("versionUpdated Linked Issue:", issue);
+            if (%issue%.issueType == issueTypeIdea) {
+                string releaseDate = dateToString(version.releaseDate);
+                string ignoreReleaseDate = getPersistentVar(issue, "Ignore_Version_Update_" + version.id);
+                if (releaseDate == ignoreReleaseDate) {
+                    echo("versionUpdated: Ignore update on issue ", issue);
+                    setPersistentVar(issue, "Ignore_Version_Update_" + version.id, "");
+                } else if (releaseDate != "") {
+                    IdeaDateFields dates = getIdeaDateFields(issue);
+                    if (
+                        (dates.dateRelease.start != releaseDate) or
+                        (dates.dateRelease.end != releaseDate)
+                    ) {
+                        dates.dateRelease.start = dateToString(version.releaseDate);
+                        dates.dateRelease.end = dates.dateRelease.start;
+                        setIdeaDateFields(issue, dates);
+                        updateIssues += issue;
+                        JProject projectDetails = getProject(getProjectKey(version.projectId));
+                        addComment(issue, currentUser(), "Delivery date set to " + dates.dateRelease.start + " from version '" + version.name + "' in project '" + projectDetails.name + "'.");
+                    }
+                }
+            }
+        } catch {
+            echo("versionUpdated: Exception on issue ", issue);                
+        }
+    }
+    for (string versionId in details.relatedIssues) {
+        try {
+            JVersion linkedVersion = getVersion(versionId);
+            if (linkedVersion.id == versionId) {
+                if (
+                    (linkedVersion.startDate != version.startDate) or
+                    (linkedVersion.releaseDate != version.releaseDate)
+                ) {
+                    echo("versionUpdated: Update version ", linkedVersion.name, " based on ", version.name);
+                    linkedVersion.startDate = version.startDate;
+                    linkedVersion.releaseDate = version.releaseDate;
+                    // this creates are new event
+                    admUpdateProjectVersion(linkedVersion);
+                }
+                if (linkedVersion.released != version.released) {
+                    admReleaseProjectVersion(linkedVersion.projectId, linkedVersion.id, linkedVersion.released);
+                }
+                if (linkedVersion.archived != version.archived) {
+                    admArchiveProjectVersion(linkedVersion.projectId, linkedVersion.id, linkedVersion.archived);
+                }
+            }
+        } catch {
+            echo("versionUpdated: Exception on version ", versionId);                
+        }
+    }
+    for (string issue in arrayToSet(updateIssues))
+        dateReleaseChanged(issue, {});
+    // find issues with a matching fixVersion
+    string[] updateReleases = selectIssues("fixVersion in (" + version.id + ")", 10000);
+    // update the release dates of these issues (this may take a lot of time)
+    FindReleases newFound;
+    foundReleases = newFound;
+    for (string issue in updateReleases) {
+        echo("versionUpdated: Update Issue:", issue);
+        updateParentReleaseDates(issue, {});
+    }
+    foundReleases = newFound;
+    // sysUnlock("queue");
+}
+
+//------------------------------------------------------------------------------
+function versionCreated(JVersion version) {
+    invalidateVersion(version);
+}
+
+//------------------------------------------------------------------------------
+function versionDeleted(JVersion version) {
+    invalidateVersion(version);
+}
+
+//------------------------------------------------------------------------------
+// Sprint Events
+//------------------------------------------------------------------------------
+
+//------------------------------------------------------------------------------
+function sprintChanged(string issue, boolean updateStartDue = true) {
+    // issues at level -1 automatically inherit their sprint form their parent.
+    // no sprintChange event generated for issues at level -1 so this event
+    // is simulated here. 
+    string[] issues = subtasks(issue);
+    //
+    for (string sprintIssue in (issues + issue))    
+        setPersistentVar(sprintIssue, "__sprints__", join(%sprintIssue%.sprints_, ","));
+    //
+    if (size(issues) == 0)
+        issues = {issue};
+    for (string issue in issues)
+        updateSprints(issue, {});
+    // update start and due dates after sprint was changed.
+    if (updateStartDue)
+        for (string issue in issues)
+            updateStartDueDates(issue, false); // call updateStartDueDates will updateSprits = false
+}
+
+//------------------------------------------------------------------------------
+function sprintCreated(JSprint sprint) {
+}
+
+//------------------------------------------------------------------------------
+function sprintUpdated(JSprint sprint, boolean deleted = false) {
+    // sprint start and end (for some reason 1 day must be added?)
+/*
+    date startDate = deleted ? null : stringToDate(getSprintStart(sprint.id, ""));
+    date endDate = deleted ? null : stringToDate(getSprintEnd(sprint.id, ""));
+*/
+    // issues in sprint
+    string[] issues;
+    if (deleted) {
+        issues = selectIssues("issueSprints ~ " + jqlQuote(sprint.id), 10000);
+        echo("sprintUpdated: ", issues);
+    } else {
+        issues = getSprintIssues(sprint.id);
+    }
+    // parents to issues in sprint
+    string[] parents;
+    for (string issue in issues)
+        parents += getParentAndImplementedBy(issue, true);
+    parents = arrayToSet(parents);
+/*
+    // update parent issues in sprint
+    // TODO: Issues can have multiple sprints! Only do this if the sprint is not closed!
+    for (string issue in arrayIntersect(issues, parents)) {
+        IdeaDateFields dates;
+        dates.dateStart.start = startDate;
+        dates.dateStart.end = startDate;
+        dates.dateFinish.start = endDate;
+        dates.dateFinish.end = endDate;
+        setIdeaDateFields(issue, dates); // TODO: Idea issues cannot be assigned to a sprint, so it is okay that release is not correcy
+    }
+*/
+    // update child issues in sprint (also updates parent issues in sprint)
+    for (string issue in arrayDiff(issues, parents))
+        sprintChanged(issue);
+}
+
+//------------------------------------------------------------------------------
+function sprintDeleted(JSprint sprint) {
+    sprintUpdated(sprint, true);
+}
+
+//------------------------------------------------------------------------------
+function sprintStarted(JSprint sprint) {
+}
+
+//------------------------------------------------------------------------------
+function sprintClosed(JSprint sprint) {
+}
+
+//------------------------------------------------------------------------------
+// Options
+//------------------------------------------------------------------------------
+
+//------------------------------------------------------------------------------
+function optionsChanged(string issue, string oldVal) {
+    // remove rollup and rolldown at the same time
+    string[] oldOptions = split(oldVal, ",");
+    string[] newOptions = %issue%.options_;
+    //
+    boolean refresh = elementExists(newOptions, optionRefresh);
+    if (refresh)
+        %issue%.options_ -= optionRefresh;
+    //
+    if (arrayElementExists(newOptions, optionRolldownStart) and arrayElementExists(newOptions, optionRollupStart))
+        %issue%.options_ -= arrayElementExists(oldOptions, optionRolldownStart) ? optionRolldownStart : optionRollupStart; 
+    if (arrayElementExists(newOptions, optionRolldownDue) and arrayElementExists(newOptions, optionRollupDue))
+        %issue%.options_ -= arrayElementExists(oldOptions, optionRolldownDue) ? optionRolldownDue : optionRollupDue;
+    //
+    if (arrayElementExists(newOptions, optionInheritDelivered) and !arrayElementExists(oldOptions, optionInheritDelivered)) {
+        dateReleaseChanged(issue, {});
+    }
+    // update start/due dates
+    if (!refresh) {
+        updateStartDueDates(issue, false);
+    } else {
+        echo("optionsChanged refreshIssue:", issue);
+        // update path of issue and children, and update start/due dates
+        parentChanged(issue, "", %issue%.parent, false, false);
+        //
+        sprintChanged(issue, false);
+        // update implemented/implementing issues, update implements fields
+        implementsLinked(issue, "", true, false);
+        for (string linkedIssue in getIssuesImplementedBy(issue))
+            implementsLinked(linkedIssue, "", true);
+        for (string linkedIssue in getIssuesImplementing(issue))
+            implementsLinked("", linkedIssue, true);
+        // update included and inclduing issues, update includes fields
+        includesLinked(issue, "", true);
+        for (string linkedIssue in getIssuesIncluding(issue))
+            includesLinked("", issue, true); // may change link direction!
+        for (string linkedIssue in getIssuesIncludedIn(issue))
+            includesLinked(issue, "", true); // may change link direction!
+        // update related issues, update relatesTo fields
+        relatesLinked(issue, "", true);
+        for (string linkedIssue in arrayToSet(getAllLinkedIssues(issue, linkRelates, 1)))
+            relatesLinked("", linkedIssue, true);
+        for (string linkedIssue in arrayToSet(getAllLinkedIssues(issue, linkRelates, -1)))
+            relatesLinked(linkedIssue, "", true);
+    }
+}
+
+//------------------------------------------------------------------------------
+// Dispatch Events
+//------------------------------------------------------------------------------
+
+//------------------------------------------------------------------------------
+// figure out what has changed and call change handlers
+//   - evens create by the "automation" user are ignored (simulates SIL engine behavior).
+function dispatch(string eventName) {
+    string eventUser;
+    if (isIssueContext())
+        eventUser = currentUserKey();
+    // get extra automation user from cache
+    if (eventUser == automationUsers[automationUserAPI]) {
+        if (false) echo("------ '", eventName, "' ignored");
+    } else {
+        echo("--------------------------------------------------------------------------------");
+        if (isIssueContext()) {
+            echo("------ '", eventName, "' Issue:", key, "/", issueType, " Summary:'", summary, "' User:", currentUsername(), "-----");
+        } else {
+            echo("------ '", eventName, "' -----");
+        }
+        switch (eventName) {
+            case "Version Created" :
+                versionCreated(getVersionFromEvent());
+                break;
+            case "Version Updated" :
+                versionUpdated(getVersionFromEvent());
+                break;
+            case "Version Deleted" :
+                versionDeleted(getVersionFromEvent());
+                break;
+
+            case "Sprint Created" :
+                sprintCreated(getSprintFromEvent());
+                break;
+            case "Sprint Updated" :
+                sysLock("queue");
+                sprintUpdated(getSprintFromEvent());
+                sysUnlock("queue");
+                break;
+            case "Sprint Deleted" :
+                sprintDeleted(getSprintFromEvent());
+                break;
+            case "Sprint Started" :
+                sprintStarted(getSprintFromEvent());
+                break;
+            case "Sprint Closed" :
+                sprintClosed(getSprintFromEvent());
+                break;
+
+            case "Issue Created" :
+                issueCreated(key);
+                break;
+            case "Issue Deleted" :
+                sysLock("queue");
+                issueDeleted(key);
+                sysUnlock("queue");
+                break;
+            case "Issue Commented" :
+                issueCommented(key, getLastComment(key));
+                break;
+            case "Issue Link Added" : 
+            case "Issue Link Deleted" :
+                boolean linkAdded = eventName == "Issue Link Added";
+                JIssueLink link = getIssueLinkFromEvent();
+                echo("---- Link:", link.name, " Direction:", link.direction, " Description:", link.description, " Target:", link.issue, " ----");
+                if (link.direction != 1) {
+                    echo("Wrong direction");
+                } else if (link.name == linkRelates) {
+                    relatesLinked(key, link.issue, linkAdded);
+                } else if (link.name == linkDuplicates) {
+                    duplicatesLinked(key, link.issue, linkAdded);
+                } else if (link.name == linkIncludes) {
+                    includesLinked(key, link.issue, linkAdded);
+                } else {
+                    sysLock("queue");
+                    if (link.name == linkImplements) {
+                        // implementsLinked may add/remove implements links
+                        implementsLinked(key, link.issue, linkAdded, true, true);
+                    } else if (link.name == linkBlocks) {
+                        blocksLinked(key, link.issue, linkAdded);
+                    }
+                    sysUnlock("queue");
+                }
+                break;
+            case "Issue Updated" : {
+                JFieldChange[] changes = getEventIssueChanges();
+                // help detect if an issue is cloned (not easy)
+                boolean cloned = false;
+                for (JFieldChange change in changes) {
+                    if ((change.field == "description") or (change.field == "status"))
+                        cloned = change.newVal == change.oldVal;
+                    if ((change.field == "Idea type"))
+                        setPersistentVar(key, "TYPE_NOT_SET", null);
+                    if (change.user != eventUser)
+                        echo("!---- change.user != eventUser");
+                    if (elementExists(automationUsers, change.user))
+                        echo("!---- change.user == automationUser");
+                    change.user = key;
+                }
+                if (cloned)
+                    setPersistentVar(key, "NOT_CLONED", null);
+                // removed unnessary changes
+                JFieldChange[] optimized;
+                for (JFieldChange change in changes) {
+                    // Merge start/due change events
+                    switch (change.field) {
+                        case "Date start" :
+                        case "Date finish" :
+                        case "Start date" :
+                        case "duedate" :
+                            change.field = "startDueDate";
+                            break;
+                    }
+                    optimized[change.field] = change;
+                }
+                // refreshIssue(key); TODO: Is this needed!?
+                // handle each change
+                for (JFieldChange change in optimized) {
+                    echo("----" + 
+                        + " Issue:", change.user, 
+                        + " Field:", change.field,
+                        + " From:'", clipText(change.oldValString, 100), "' (", clipText(change.oldVal, 100), ")", 
+                        + " To:'", clipText(change.newValString, 100), "' (", clipText(change.newVal, 100), ")",
+                    + " ----");
+                    switch(change.field) {
+                        case "Rank" :
+                            rankChanged(change.user);
+                            continue;
+                        case "Team" :
+                            teamChanged(change.user);
+                            continue;
+                        case "Responsible" :
+                            responsibleChanged(change.user, change.oldVal, change.newVal);
+                            continue;
+                        case "assignee" :
+                        case "reporter" :
+                            involvedChanged(change.user, change.field, change.newVal);
+                            continue;
+                        case "description" :
+                            descriptionChanged(change.user);
+                            continue;
+                        case "Short description" :
+                            shortDescriptionChanged(change.user);
+                            continue;
+                        case "Tags" :
+                            tagsChanged(change.user);
+                            continue;
+                        case "Stage" :
+                	        sysLock("status");
+                            stageChanged(change.user, {});
+                            sysUnlock("status");
+                            continue;
+                        case "status" : {
+                            invalidateIssueStatusField(change.user);
+                	        sysLock("status");
+                            statusChanged(change.user, {});
+                            sysUnlock("status");
+                            continue;
+                        };
+                        case "summary" :
+                            sysLock("queue");
+        	                summaryChanged(change.user, change.oldVal);
+                            sysUnlock("queue");
+                            continue;
+        	            case "Idea type":
+        	                ideaTypeChanged(change.user, change.oldValString, change.newValString);
+                            continue;
+        	            case "IssueParentAssociation" : // Parent changed, only called on child issue. Not called when child is deleted.
+                	        sysLock("queue");
+        	                parentChanged(change.user, getIssueKeyFromId(change.oldVal), getIssueKeyFromId(change.newVal), false, false);
+                            sysUnlock("queue");
+                            continue;
+                        case "Delivered quarter" :
+                            releaseQuarterChanged(change.user);
+                            continue;
+                        case "Date delivered" :
+                            invalidateIdeaDateFields(change.user); // remove cached idea date fields
+                	        // sysLock("queue");
+                            dateReleaseChanged(change.user, {});
+                            // sysUnlock("queue");
+                            continue;
+                        case "Fix Version" :
+                            // fixVersions
+                            versionChanged(change.user);
+                            continue;
+                        case "Sprint" :
+                	        sysLock("queue");
+                            sprintChanged(change.user);
+                            sysUnlock("queue");
+                            continue;
+                        case "startDueDate" :
+                            invalidateIdeaDateFields(change.user); // remove cached idea date fields
+                            updateStartDueDates(change.user);
+                            continue;
+                        case "Options" :
+                            optionsChanged(change.user, change.oldValString);
+                            continue;
+        	        }
+        	        for (string fieldName in arrayKeys(docFields)) {
+        	            if (change.field == fieldName) {
+        	                sysLock("docs");
+        	                docFieldChanged(change.user, change.field, change.oldVal, change.newVal, {});
+        	                sysUnlock("docs");
+        	                change.field = "";
+        	                break;
+        	           }
+        	        }
+        	        if (change.field == "")
+        	            continue;
+        	        for (string fieldName in arrayKeys(domainFields)) {
+        	            if (change.field == fieldName) {
+        	                sysLock("domains");
+        	                domainFieldChanged(change.user, change.field, change.oldValString, change.newValString, {});
+        	                sysUnlock("domains");
+        	                change.field = "";
+        	                break;
+        	           }
+        	        }
+        	        if (change.field == "")
+        	            continue;
+                    echo("dispatch: Update issue unhandled field '", change.field, "' on issue '", change.user, "'");
+                }
+            }
+        }
+        echo("--------------------------------------------------------------------------------");
+    }
+}
+
+//------------------------------------------------------------------------------
+// Webhook events
+//------------------------------------------------------------------------------
+
+//------------------------------------------------------------------------------
+// dispatch webhook events
+//  - all events expected to use the same json format (WebhookEvent)
+//  - sil webhook token EC0d-KlxxhmfoOlaVTPyieowuob4uMC98DZMDKATGCnhs4_uKWBqv9jIzCeFXkeIsAJod0y-DtAvAeY46VUpBnfTacmygX1I3f_mlfd4sWyZPdRypof3JVNPMi65PGzpUwFmKhxxyvsCm5WWgkEyYb_tu_J9Dc5xxL7Pn8zBXN36ImV
+struct WebhookEvent {
+    string user;
+    string event;
+    string issue;
+    string linkType;
+    string issueType;
+    string summary;
+    string labels;
+    string label;
+    string sprint;
+    string from;
+    string to;
+    string operation;
+    string project;
+    string target;
+    string delivers;
+    string includeIssueDelivered;
+    string copyToChildren;
+    string copyToDelivering;
+    string copyToAll;
+    string copyStatus;
+    string copyStage;
+    string copyDescription;
+    string copyStartDue;
+    string feedback;
+    string email;
+}
+
+//------------------------------------------------------------------------------
+// https://o5u4rphxbc3o2fppgqdieto5li0gfxzd.lambda-url.eu-north-1.on.aws/
+// https://eu-north-1.console.aws.amazon.com/lambda/home?region=eu-north-1#/functions/httpServer
+struct createFeedbackResponse {
+    string result;
+}
+function createFeedback(string summary, string feedback, string email) {
+    echo("createFeedback sumary:", summary, " feedback:", feedback, " email:", email);
+    // create new issue
+    string newIssue = createIssue("DI", "", issueTypeIdea, summary);
+    %newIssue%.ideaType = ideaTypeIdea;
+    %newIssue%.description = feedback;
+    %newIssue%.requestChannel = requestChannelOnlineForm;
+    %newIssue%.requestFrom = email;
+    DateRange dateRange;
+    dateRange.start = dateToString(currentDate());
+    dateRange.end = dateRange.start;
+    setIssueRequestDateField(newIssue, dateRange);
+    issueCreated(newIssue);
+    // create response
+    createFeedbackResponse response;
+    response.result = "thanks :)";
+    appendToWebhookResponse(toJson(response));
+}
+
+//------------------------------------------------------------------------------
+function refreshTeamMembers() {
+    string[] issues = selectIssues("\"Team[Team]\" is not empty", 10000);
+    boolean[] cached;
+    string[][] teams;
+    for (string issue in issues) {
+        string team = getIssueTeamField(issue).id;
+        if (!cached[team]) {
+            cached[team] = true;
+            invalidateTeamMembers(team);
+            teams[team] = getTeamMembers(team);
+        }
+        updateTeamResponsible(issue, teams[team]);
+    }
+}
+
+//------------------------------------------------------------------------------
+// add/remove labels to issue and all children
+function labelIssueAndChildren(string issue, string labels, string operation) {
+    string[] issues = arrayAddElement(getChildren(issue, true), issue);
+    string[] labelsArray = split(labels, " ");
+    for (string issue in issues) {
+        if (containsText(operation, "add"))
+            %issue%.labels += labelsArray;
+        if (containsText(operation, "remove"))
+            %issue%.labels += labelsArray;
+        else
+            echo("labelIssueAndChildren unknown operation ", operation);
+    }
+}
+
+//------------------------------------------------------------------------------
+// remove labels from all issues
+function removeLabels(string labels) {
+    string[] labelsArray = split(labels, " ");
+    if (arraySize(labelsArray) > 0) {
+        string[] issues = selectIssues("labels = " + join(labelsArray, "OR labels ="), 10000);
+        for (string issue in issues) {
+            %issue%.labels -= labelsArray;
+        }
+    }
+}
+
+//------------------------------------------------------------------------------
+// rename a label in all issues (remove old label, then add new label)
+function renameLabel(string from, string to) {
+    string[] issues = selectIssues("label = " + from, 10000);
+    for (string issue in issues) {
+        %issue%.labels -= from;
+        %issue%.labels += to;
+    }
+}
+
+//------------------------------------------------------------------------------
+function deleteIssuesWithLabel(string project, string label) {
+    if (!contains(label, " ")) {
+        string[] issues = selectIssues("project = " + project + " AND labels = " + jqlQuote(label), 10000);
+        for (string issue in issues) {
+            echo("deleteIssuesWithLabel: Delete:", issue);
+            deleteIssue(issue);
+        }
+    }
+}
+
+//------------------------------------------------------------------------------
+function deleteSprintFromProject(string project, string sprintName) {
+    ProjectSprints projectSprints = getProjectSprints(project);
+    JSprint[] allSprints;
+    for (JSprint sprint in projectSprints.openSprints)
+        allSprints["_" + sprint.id] = sprint;
+    for (JSprint sprint in projectSprints.closedSprints)
+        allSprints["_" + sprint.id] = sprint;
+    for (JSprint sprint in allSprints) {
+        if (sprint.name == sprintName) {
+            echo("deleteSprintFromProject Delete:", sprint.id);
+            deleteSprint(sprint.id);
+        }
+    }
+}
+
+//------------------------------------------------------------------------------
+function clearAlerts() {
+    string[]issues = selectIssues("\"Alerts[checkboxes]\" IN (\"" + alertLinkLoop + "\")", 10000);
+    for (string issue in issues) {
+        %issue%.alerts_ -= alertLinkLoop;
+    }
+}
+
+//------------------------------------------------------------------------------
+function changeIssueType(string issue, string issueType) {
+    string issueTypeId = issueTypeIdForProject(%issue%.project, issueType);
+    echo("setIssueType issue:", issue, " issueType:", issueType, " issueTypeId:", issueTypeId);
+    setIssueType(issue, issueTypeId);
+    refreshIssue(issue);
+}
+
+//------------------------------------------------------------------------------
+function copyFromParent(WebhookEvent event) {
+    string child = event.issue;
+    string parent = %child%.parent;
+    if (parent != "") {
+        if (event.copyStatus == "true")
+            setIssueStatusField(child, getIssueStatusField(parent).name);
+        if (event.copyStage == "true")
+            %child%.stage = %parent%.stage;
+        if (event.copyStartDue == "true") {
+            IdeaDateFields dates = getIdeaDateFields(parent);
+            if (%child%.issueTypes == issueTypeIdea)
+                dates.dateRelease = getIdeaDateFields(child).dateRelease;
+            setIdeaDateFields(child, dates);
+        }
+        if (event.copyDescription == "true")
+            %child%.description = %parent%.description;
+        //
+        if (event.copyStatus == "true")
+            statusChanged(child, {});
+        if (event.copyStage == "true")
+            stageChanged(child, {});
+        if (event.copyStartDue == "true") {
+            updateStartDueDates(child);
+        }
+        if (event.copyDescription == "true") {
+            descriptionChanged(child);
+        }
+    }
+}
+
+//------------------------------------------------------------------------------
+function copyToChildren(WebhookEvent event) {
+    string issue = event.issue;
+    string[] children;
+    boolean all = event.copyToAll == "true";
+    if (event.copyToChildren + event.copyToDelivering == "truetrue")
+        children = getChildrenAndImplementing(issue, all);
+    else if (event.copyToChildren == "true")
+        children = getChildren(issue, all);
+    else if (event.copyToDelivering == "true")
+        children = getIssuesImplementing(issue, all);
+    //
+    IssueStatusField issueStatus = getIssueStatusField(issue);
+    string issueStage = %issue%.stage;
+    IdeaDateFields dates = getIdeaDateFields(issue);
+    for (string child in children) {
+        if (event.copyStatus == "true")
+            setIssueStatusField(child, issueStatus.name);
+        if (event.copyStage == "true")
+            %child%.stage = issueStage;
+        if (event.copyStartDue == "true") {
+            if (%child%.issueTypes == issueTypeIdea)
+                dates.dateRelease = getIdeaDateFields(child).dateRelease;
+            setIdeaDateFields(child, dates);
+        }
+        if (event.copyDescription == "true")
+            %child%.description = %issue%.description;
+    }
+    for (string child in children) {
+        if (event.copyStatus == "true")
+            statusChanged(child, {});
+        if (event.copyStage == "true")
+            stageChanged(child, {});
+        if (event.copyStartDue == "true") {
+            updateStartDueDates(child);
+        }
+        if (event.copyDescription == "true") {
+            descriptionChanged(child);
+        }
+    }
+}
+
+//------------------------------------------------------------------------------
+// create sibling issue
+function createSibling(string user, string issue, string summary) {
+    sysLock("queue");
+    saveModifiedIssues();
+    string newIssue = createIssueRaw(%issue%.project, %issue%.parent, %issue%.issueType, summary, "");
+    sysSleep(2000);
+    %newIssue%.reporter = user;
+    // trigger issue created event
+    issueCreated(newIssue);
+    sysUnlock("queue");
+}
+
+//------------------------------------------------------------------------------
+function createDelivery(string user, string issue, string summary, string target, string delivers, boolean includeIssueDelivered) {
+    target = toUpper(trim(target));
+    if (target == "")
+        target = issue;
+    string project = split(target, "-")[0];
+    delivers = toUpper(trim(delivers));
+    if (delivers == "")
+        delivers = issue;
+    string issueType;
+    if (project != target) {
+        string[] parentIssues;
+        parentIssues[issueTypeFeature] = issueTypeOther;
+        parentIssues[issueTypeOther] = issueTypeTask;
+        parentIssues[issueTypeStage] = issueTypeTask;
+        parentIssues[issueTypeEpic] = issueTypeStory;
+        parentIssues[issueTypeStory] = issueTypeSubtask;
+        parentIssues[issueTypeBug] = issueTypeSubtask;
+        issueType = parentIssues[%target%.issueType];
+    } else {
+        string[] issueTypes;
+        for (string projectIssueType in issueTypesForProject(project))
+            issueTypes[projectIssueType] = projectIssueType;
+        for (string findIssueType in {issueTypeFeature, issueTypeEpic, issueTypeIdea}) {
+            issueType = issueTypes[findIssueType];
+            if (issueType != "")
+                break;
+        }
+    }
+    if (issueType != "") {
+        string[] deliverIssues = {delivers};
+        summary = trimAll(summary);
+        if ((summary == "") or (summary == "."))
+            summary = defaultSummary(deliverIssues, ".");
+        sysLock("queue");
+        string newIssue = createIssueRaw(project, target == project ? "" : target, issueType, summary, "");
+        sysSleep(2000); // sleep after creating an issue, before modifying it.
+        %newIssue%.status = %issue%.status;
+        %newIssue%.stage = %issue%.stage;
+        %newIssue%.reporter = user;
+        saveModifiedIssuesEx();
+        issueCreated(newIssue);
+        for (string deliverIssue in deliverIssues)
+            linkIssue(newIssue, deliverIssue, linkImplements); // creates a new event!
+        sysUnlock("queue");
+    }
+}
+
+//------------------------------------------------------------------------------
+function dispatchWebhook(WebhookPayload request) {
+    WebhookEvent event = fromJson(request.payload);
+    echo("------ Webhook '", event.event, "' Issue:", event.issue, "-----");
+    switch (event.event) {
+        case "createFeedback" :
+            createFeedback(event.summary, event.feedback, event.email);
+            break;
+        case "issueDeleted" :
+            if (event.linkType == linkRelates) {
+                relatesLinked(event.issue, null, false);
+            } else {
+                sysLock("queue");
+                if (event.linkType == linkImplements) {
+                    implementsLinked(event.issue, null, false);
+                } else if (event.linkType == linkBlocks) {
+                    blocksLinked(event.issue, null, false);
+                }
+                sysUnlock("queue");
+            }
+            break;
+        case "createSibling" :
+            createSibling(event.user, event.issue, event.summary);
+            break;
+        case "createDelivery" :
+            createDelivery(event.user, event.issue, event.summary, event.target, event.delivers, event.includeIssueDelivered);
+            break;
+        case "deleteIssueAndChildren" :
+            deleteIssueAndChildren({event.issue});
+            break;
+        case "deleteIssuesWithLabel" : {
+            string issue = event.issue;
+            deleteIssuesWithLabel(%issue%.project, event.label);
+            break;
+        }
+        case "labelIssueAndChildren" :
+            labelIssueAndChildren(event.issue, event.labels, event.operation);
+            break;
+        case "removeLabels" :
+            removeLabels(event.labels);
+            break;
+        case "renameLabel" :
+            renameLabel(event.from, event.to);
+            break;
+        case "refreshTeamMembers" :
+            refreshTeamMembers();
+            break;
+        case "clearAlerts" :
+            clearAlerts();
+            break;
+        case "copyFromParent" :
+            copyFromParent(event);
+            break;
+        case "copyToChildren" :
+            copyToChildren(event);
+            break;
+        case "deleteSprint" : {
+            string issue = event.issue;
+            deleteSprintFromProject(%issue%.project, event.sprint);
+            break;
+        }
+        case "setIssueType" :
+            changeIssueType(event.issue, event.issueType);
+            break;
+        default :
+            echo("!Unknown event ", event.event);
+    }
+}
+
+//------------------------------------------------------------------------------
+// Scheduler
+//------------------------------------------------------------------------------
+
+//------------------------------------------------------------------------------
+// called via SIL scheduler
+function updateIssueAge() {
+    echo("updateIssugeAge");
+}
+
+//------------------------------------------------------------------------------
+// Main
+//------------------------------------------------------------------------------
+
+//------------------------------------------------------------------------------
+// main
+// echo("--------------------------------------------------------------------------------");
+if (true) do {
+    if (arrayElementExists(argv, "updateIssueAge")) {
+        echo("--------------------------------------------------------------------------------");
+        updateIssueAge();
+        echo("--------------------------------------------------------------------------------");
+        break;
+    }
+    string eventName = getEventName();
+    if (eventName != "") {
+        dispatch(eventName);
+        break;
+    } 
+    WebhookPayload request = getWebhookPayload();
+    if (isNotNull(request)) {
+        echo("--------------------------------------------------------------------------------");
+        dispatchWebhook(request);
+        echo("--------------------------------------------------------------------------------");
+        break;
+    }
+
+    echo("--------------------------------------------------------------------------------");
+    echo("----------- Execute this script in an event listner ----------------------------");
+    
+    if (false) {
+        setPersistentVar("statusDetails", "{}");
+    }
+
+    if (false) {
+        string[] issues = selectIssues("project != empty", 10000);
+        for (string issue in issues) {
+            echo("rank issue:", issue, " summary:", %issue%.summary);
+            rankChanged(issue);
+        }
+    }
+
+    if (false) {
+        string[] issues = selectIssues("project = DE", 10000);
+        for (string issue in issues) {
+            echo("issue:", issue, " summary:", %issue%.summary);
+            %issue%.options_ += optionRefresh;
+            optionsChanged(issue, join(%issue%.options_, ","));
+        }
+    }
+
+    if (false) {
+        string[] toProjects;
+        toProjects["ES"] = "MS";
+        cloneProjects(toProjects);
+    }
+    
+    if (false) {
+        refreshTeamMembers();
+    }
+
+    if (false) {
+        string[] projects = allProjects();
+        for (string project in projects) {
+            echo(issueTypesForProject(project));
+        }
+    }
+
+    if (false) {
+        // https://us1.powerscripts.anova.appfire.app/rest/keplerrominfo/refapp/latest/persistent/vars/
+        // https://us1.powerscripts.anova.appfire.app/rest/keplerrominfo/refapp/latest/persistent/var/DL-674_TYPE_NOT_SET/
+        string auth = "JWT eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiI1Y2ZiZWRkYzk5NDMyMzBlNzdhZDUwMjYiLCJxc2giOiJjb250ZXh0LXFzaCIsImlzcyI6IjhkNzgxYmY1LTJiYjQtMzk4ZS04NTQ0LWEzMTRhYTEzZTczMCIsImNvbnRleHQiOnsibGljZW5zZSI6eyJhY3RpdmUiOnRydWV9LCJ1cmwiOnsiZGlzcGxheVVybCI6Imh0dHBzOlwvXC9kZWpvbmdoLmF0bGFzc2lhbi5uZXQiLCJkaXNwbGF5VXJsU2VydmljZWRlc2tIZWxwQ2VudGVyIjoiaHR0cHM6XC9cL2Rlam9uZ2guYXRsYXNzaWFuLm5ldCJ9fSwiZXhwIjoxNzI3MDQwNzA4LCJpYXQiOjE3MjcwMzk4MDh9.Q3a9dQgdZ0hJxqWsK-OAYzLv_HMyx7NTiL2I0QPj8uo";
+        HttpRequest request; 
+        request.headers += httpCreateHeader("Content-Type", "application/json"); 
+        request.headers += httpCreateHeader("Authorization", auth);
+        string response = httpGet("https://us1.powerscripts.anova.appfire.app/rest/keplerrominfo/refapp/latest/persistent/vars/", request);
+        number statusCode = httpGetStatusCode();
+        if (statusCode > 200 && statusCode >= 300) {
+            echo("!getStatusDetails Error ", trim(statusCode), ":", httpGetErrorMessage(), ":", httpGetReasonPhrase());
+        }
+        string[] items = fromJson(response);
+        for (string name in arrayKeys(items)) {
+            echo(name);
+            HttpRequest request; 
+            request.headers += httpCreateHeader("Content-Type", "application/json"); 
+            request.headers += httpCreateHeader("Authorization", auth);
+            string response = httpDelete("https://us1.powerscripts.anova.appfire.app/rest/keplerrominfo/refapp/latest/persistent/var/" + name + "/", request);
+            number statusCode = httpGetStatusCode();
+            if (statusCode > 200 && statusCode >= 300) {
+                echo("!getStatusDetails Error ", trim(statusCode), ":", httpGetErrorMessage(), ":", httpGetReasonPhrase());
+            }
+        }
+    }
+    echo("--------------------------------------------------------------------------------");
+} while(false);
+// echo("--------------------------------------------------------------------------------\n");
+
+/*
+HttpRequest request; 
+        request.headers += httpCreateHeader("Content-Type", "application/json");
+        string json = ""
++ "{"
++ "'type':'page'," 
++ "'title':'hello'," 
++ "'space':{'key':'MPS2U'}," 
++ "'body':{"
++ "}"
++ "}"
+;
+
+
+        request.headers += httpBasicAuthHeader(apiUser, apiToken); // https://id.atlassian.com/manage-profile/security/api-tokens
+        string response = httpPost(getJIRABaseUrl() + "/wiki/rest/api/content", request, json);
+        number statusCode = httpGetStatusCode();
+        if (statusCode > 200 && statusCode >= 300) {
+            echo("!failed Error:", trim(statusCode), " Message:", httpGetErrorMessage(), " Reason:", httpGetReasonPhrase(), " Json:", json);
+        }
+        echo(response);
+*/

@@ -1,0 +1,336 @@
+include "credentials";
+
+//------------------------------------------------------------------------------
+// common structs in REST API responses
+struct JsonIdField {
+    string id;
+}
+struct JsonKeyField {
+    string key;
+}
+
+//------------------------------------------------------------------------------
+// session (unique for each script execution)
+const string session = formatDate(currentDate(), "yyyy-MM-dd HH:mm:ss.SSS");
+
+//------------------------------------------------------------------------------
+// automation user will be initialized later
+const string automationUserAPI = "API"; // User "Power Scripts Automation" used for calling Jira APIs
+const string automationUserJira = "Jira"; // User "Jira Automation" the system automation user
+const string automationUserSIL = "SIL"; // User "Power Scripts" the Power Scripts automation user
+string[] automationUsers;
+
+//------------------------------------------------------------------------------
+// infinite loop
+integer infiniteLoopCount;
+integer throwException;
+function breakInfiniteLoop(boolean reset = false) {
+    if (reset)
+        infiniteLoopCount = 0;
+    if (infiniteLoopCount++ > 500)
+        throwException = throwException / throwException;
+}
+
+//------------------------------------------------------------------------------
+// log message
+//  - if enabled a message that starts with "!" will cause division by zero exception, so that a stack trace is generated
+function echo(string m1 = "", string m2 = "", string m3 = "", string m4 = "", string m5 = "", string m6 = "", string m7 = "", string m8 = "", string m9 = "", string m10 = "", string m11 = "", string m12 = "", string m13 = "", string m14 = "", string m15 = "", string m16 = "", string m17 = "", string m18 = "", string m19 = "", string m20 = "") {
+    string msg = m1 + m2 + m3 + m4 + m5 + m6 + m7 + m8 + m9 + m10 + m11 + m12 + m13 + m14 + m15 + m16 + m17 + m18 + m19 + m20;
+    if (true or (msg[0] == "!"))
+        logPrint("INFO", "@" + session + " " + msg);
+    if (false and (msg[0] == "!"))
+        number error = 0 / trunc(0.5, 0);
+}
+
+//------------------------------------------------------------------------------
+// check if age is < milliSeconds from now
+function isCacheExpired(string age, number milliSeconds) {
+    boolean result = true;
+    if (age != "") {
+        try {
+            date cacheAge = parseDate("yyyy-MM-dd HH:mm:ss.SSS", age);
+            result = currentDate() - cacheAge > millisToInterval(milliSeconds);
+        } catch {}
+    }
+    return result;
+}
+
+//------------------------------------------------------------------------------
+// this function does not work with fromJson.
+//  - it seems fromJson must be called in an assignment statement?
+/*
+function getPersistentItem(string name) {
+    string value = getPersistentVar(name);
+    if (isNull(value)) value = "{}";
+    return value;
+}
+*/
+
+//------------------------------------------------------------------------------
+// used by the functions that rollup/rolldown dates
+//   - enables rollup functions to terminate if there is a new rollup event
+function isSessionReplaced(string issue, boolean stop = false, boolean startIssue = false) {
+    string currentSession = getPersistentVar(issue, "session" + (startIssue ? "_start" : ""));
+    boolean replaced;
+    replaced = session < currentSession;
+    if (replaced) {
+        // echo("isSessionReplaced: StartIssue:", startIssue, " Issue:", issue, " thisSession:", session, " currentSession:", currentSession);
+        if (stop)
+            throw "sessionReplaced" + (startIssue ? " startIssue" : "");
+    }
+    return replaced;
+}
+
+//------------------------------------------------------------------------------
+// call saveModifiedIssues after 50 issues have been modified
+//  - if called without an issue, then saveModifiedIssues is called immediately
+boolean[] modifiedIssues;
+function saveModifiedIssuesEx(string issue = "") {
+    if (issue != "")
+        modifiedIssues[issue] = true;
+    if ((issue == "") or (size(modifiedIssues) >= 50)) {
+        modifiedIssues = {};
+        saveModifiedIssues();
+    }
+}
+
+
+//------------------------------------------------------------------------------
+// find the issue key by issue id
+//  - I could not find a function to get issue key from issue id, so I created
+//    this version. It cache the key for fast lookup.
+function getIssueKeyFromId(string id) {
+    string key;
+    if (!isNull(id)) {
+        string name = "issueKey_" + id;
+        key = "" + getPersistentVar(name);
+        if (key == "") {
+            key = selectIssues("id = " + id, 1)[0];
+            setPersistentVar(name, key);
+            // echo("getIssueKeyFromId: id:", id, " key:", key, " key.id:", %key%.id)
+        }
+    }
+    return key;
+}
+
+//------------------------------------------------------------------------------
+// remove extra whitespace from text (only looks for space character)
+//  - trims start and end of string
+//  - trims all double spaces inside string
+function trimAll(string text) {
+    number oldLen = 0;
+    number newLen = length(text);
+    text = trim(text);
+    while (oldLen != newLen) {
+        oldLen = newLen;
+        text = replace(text, "  ", " ");
+        newLen = length(text);
+    }
+    return text;
+}
+
+//------------------------------------------------------------------------------
+// case insentive conatnis
+function containsText(string text, string contains) {
+    return contains(toLower(text), toLower(contains));
+}
+
+//------------------------------------------------------------------------------
+// shorten text
+//  - shorten text and adds "..." if it happens
+//  - may clip UF8 multi-byte-characters (not tested)
+//  - max length must be >= 3
+function clipText(string text, number maxLength) {
+    if (length(text) > maxLength)
+        text = chop(text, maxLength - 3) + "...";
+    return text;
+}
+
+//------------------------------------------------------------------------------
+// add prefix and separator to text if both prefix and text are not empty
+function prefixText(string prefix, string separator, string text) {
+    if ((text != "") and (prefix != ""))
+        text = prefix + separator + text;
+    return text;
+}
+
+//------------------------------------------------------------------------------
+// add separator to text if text and append is not empty
+// add append to text if append is not empty
+function appendText(string text, string append, string separator) {
+    if ((text != "") and (append != ""))
+        text += separator;
+    return text + append;
+}
+
+//------------------------------------------------------------------------------
+// quote a string for jql query (double quote is requered for excact match text query)
+function jqlQuote(string s, boolean doubleQuote = false) {
+    if (doubleQuote) s = "\"" + s + "\"";
+    s = "\""+ replace(s, "\"", "\\\"") + "\"";
+    return s;
+}
+
+//------------------------------------------------------------------------------
+// add string to array (if array is null, then add to new array)
+function addToArray(string[] array, string value) {
+    if (isNull(array))
+        array = {};
+    if (isNotNull(value))
+        array = arrayAddElementIfNotExist(array, value);
+    return array;
+}
+
+//------------------------------------------------------------------------------
+// convert array to text (may clip UTF8 multi-byte-characters)
+function arrayToText(string prefix, string[] array) {
+    string text;
+    if (isNotNull(array))
+        text = clipText(prefixText(prefix, "", join(arraySort(array, false), ", ")), 255);
+    return text;
+}
+
+//------------------------------------------------------------------------------
+// find key by value (returns first key with that value)
+function arrayGetKey(string[] array, string value) {
+    string found;
+    for(string key in arrayKeys(array)) {
+        if (array[key] == value) {
+            found = key;
+            break;
+        }
+    }
+    return found;
+}
+
+//------------------------------------------------------------------------------
+// jira product discovery date range (different from normal jira dates)
+struct DateRange {
+    string start;
+    string end;
+}
+
+//------------------------------------------------------------------------------
+// convert date to string (make sure SIL engine timezone is set to UCT)
+//  - It seems that a day is randomly subtracted or added from dates. It chould
+//    be a timezone issue.
+function dateToString(date d) {
+    string s;
+    if (isNotNull(d)) 
+        s = formatDate(d, "yyyy-MM-dd");
+    return s;
+}
+
+//------------------------------------------------------------------------------
+// convert string to date (make sure SIL engine timezone is set to UCT)
+function stringToDate(string s) {
+    date d;
+    try {
+        if (s != "") 
+            d = parseDate("yyyy-MM-dd HH:mm:ss", s + " 00:00:00");
+    } catch {};
+    return d;
+}
+
+//------------------------------------------------------------------------------
+// convert json to JPD date range
+function jsonToDateRange(string jpdDate) {
+    DateRange dateRange;
+    if (isNotNull(jpdDate)) 
+        dateRange = fromJson(jpdDate);
+    return dateRange;
+}
+
+//------------------------------------------------------------------------------
+// convert JPD date range to json
+function dateRangeToJson(DateRange d) {
+    string json;
+    if (isNull(d.start) or isNull(d.end))
+        json = null;
+    else
+        json = "{\"start\":\"" + d.start + "\",\"end\":\"" + d.end + "\"}";
+    return json;
+}
+
+//------------------------------------------------------------------------------
+// convert JPD date range to string (day, month, quarter)
+function dateRangeToString(DateRange d) {
+    string s = d.start;
+    if (s + d.end != "") {
+        if (s != d.end) {
+            s = substring(s, 0, 7);
+            if (s != substring(d.end, 0, 7)) {
+                s = (
+                    substring(s, 0, 5) + "Q" +
+                    ((floor(substring(s, 5, 7), 1) - 1) / 3 + 1)
+                );
+            }
+        }
+    }
+    return s;
+}
+
+
+//------------------------------------------------------------------------------
+function jiraGet(string url) {
+    string response;
+    for(integer i = 0;; i += 1) {
+        HttpRequest request; 
+        request.headers += httpCreateHeader("Content-Type", "application/json"); 
+        request.headers += httpBasicAuthHeader(apiUser, apiToken);
+        url = getJIRABaseUrl() + url;
+        response = httpGet(url, request);
+        integer statusCode = httpGetStatusCode();
+        if (statusCode < 300)
+            break;
+        echo("!jiraGet Error[", i, "] Status:", statusCode, " Message:", httpGetErrorMessage(), " Reason:", httpGetReasonPhrase());
+        if (i >= apiRetries)
+            throw "HTTP error " + statusCode + " on " + url;
+        sysSleep(i * 1000);
+    }
+    return response;
+}
+
+//------------------------------------------------------------------------------
+function jiraPut(string url, string json, boolean post = false) {
+    string response;
+    url = getJIRABaseUrl() + url;
+    for(integer i = 0;; i += 1) {
+        HttpRequest request; 
+        request.headers += httpCreateHeader("Content-Type", "application/json"); 
+        request.headers += httpBasicAuthHeader(apiUser, apiToken);
+        if (post)
+            response = httpPost(url, request, json);
+        else
+            response = httpPut(url, request, json);
+        integer statusCode = httpGetStatusCode();
+        if (statusCode < 300)
+            break;
+        echo("!jiraGet Error[", i, "] Status:", statusCode, " Message:", httpGetErrorMessage(), " Reason:", httpGetReasonPhrase());
+        if (i >= apiRetries)
+            throw "HTTP error " + statusCode + " on " + url;
+        sysSleep(i * 1000);
+    }
+    return response;
+}
+
+//------------------------------------------------------------------------------
+function jiraPost(string url, string json) {
+    return jiraPut(url, json, true);
+}
+
+//------------------------------------------------------------------------------
+string json = "" + getPersistentVar("automationUsers");
+if (json != "") {
+    automationUsers = fromJson(json);
+} else {
+    // get automation users and store in cache
+    automationUsers[automationUserAPI] = getUserByEmail(apiUser).key;
+    automationUsers[automationUserJira] = "557058:f58131cb-b67d-43c7-b30d-6b58d40bd077";
+    automationUsers[automationUserSIL] = "5aafac11a903362a57893e59";
+    json = "{";
+    for (string key in arrayKeys(automationUsers))
+        json += (json == "{" ? "" : ",") + "\"" + key + "\":\"" + automationUsers[key] + "\"";
+    json += "}";
+    setPersistentVar("automationUsers", json);
+}

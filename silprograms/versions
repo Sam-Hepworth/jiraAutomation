@@ -1,0 +1,125 @@
+include "echo";
+
+//------------------------------------------------------------------------------
+// https://dejongh.atlassian.net/rest/api/3/project/MS/versions
+struct ProjectVersions {
+    JVersion[] projectVersions;
+    string age;
+}
+function getProjectVersionsEx(string project) {
+    ProjectVersions versions;
+    if (project != "") {
+        string name = "project_versions_" + project;
+        try {
+            versions = fromJson("" + getPersistentVar(name));
+        } catch {}
+        if (isCacheExpired(versions.age, 60 * 1000)) {
+            string response = jiraGet("/rest/api/3/project/" + project + "/versions");
+            versions.projectVersions = fromJson(response);
+            versions.age = formatDate(currentDate(), "yyyy-MM-dd HH:mm:ss.SSS");
+            // echo("getVersionDetails Version:", versionId, " RelatedWork:", version.relatedWork);
+            setPersistentVar(name, toJson(versions));
+        }
+    }
+    // echo("getProjectVersionsEx Project:", project, " Versions:", versions);
+    return versions.projectVersions;
+}
+
+//------------------------------------------------------------------------------
+function invalidateVersion(JVersion version) {
+    setPersistentVar("project_versions_" + getProjectKeyById(version.projectId), "{}");
+    setPersistentVar("version_details_" + version.id, "{}");
+}
+
+//------------------------------------------------------------------------------
+// get version details (related work)
+struct VersionRelatedWork {
+    string category; // "Design", "Communications", "External Link"
+    integer issueId;
+    string relatedWorkId;
+    string title;
+    string url;
+}
+struct VersionDetails {
+    VersionRelatedWork[] relatedWork;
+    string[] relatedIssues;
+    string[] relatedVersions;
+    string age;
+}
+function getVersionDetails(string versionId) {
+    VersionDetails version;
+    if (versionId != "") {
+        string name = "version_details_" + versionId;
+        try {
+            version = fromJson("" + getPersistentVar(name));
+        } catch {}
+        if (isCacheExpired(version.age, 60 * 1000)) {
+            string response = jiraGet("/rest/api/3/version/" + versionId + "/relatedwork");
+            version.relatedWork = fromJson(response);
+            for (VersionRelatedWork related in version.relatedWork) {
+                if (related.url != "") {
+                    string linkedIssue = matchReplace(related.url, ".*?selectedIssue=(\\w+\\-\\d+).*", "$1");
+                    if (linkedIssue == related.url)
+                        linkedIssue = matchReplace(related.url, ".*?/browse/(\\w+\\-\\d+)", "$1");
+                    if ((linkedIssue != "") and (linkedIssue != related.url))
+                        version.relatedIssues[linkedIssue] = linkedIssue;
+                    string linkedVersion = matchReplace(related.url, "/projects/(\\w+?)/versions/(\\d+)/.*", "$2");
+                    if ((linkedVersion != "") and (linkedVersion != related.url))
+                        version.relatedVersions[linkedVersion] = linkedVersion;
+                }
+            }
+            version.age = formatDate(currentDate(), "yyyy-MM-dd HH:mm:ss.SSS");
+            // echo("getVersionDetails Version:", versionId, " RelatedWork:", version.relatedWork);
+            setPersistentVar(name, toJson(version));
+        }
+    }
+    // echo("getVersionDetails Version:", versionId, " Details:", version);
+    return version;
+}
+
+//------------------------------------------------------------------------------
+// Find releases (ideas) linked to versions
+// https://dejongh.atlassian.net/browse/DI-121
+function findLinkedVersions(string issue) {
+    JVersion[] result;
+    for (string project in allProjects()) {
+        for (JVersion version in getProjectVersionsEx(project)) {
+            VersionDetails details = getVersionDetails(version.id);
+            for (string linkedIssue in details.relatedIssues) {
+                if (linkedIssue == issue)
+                    result["_" + version.id] = version;
+            }
+        }
+    }
+    return result;
+}
+
+// https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-project-versions/#api-rest-api-3-version-id-relatedwork-get
+/*
+const response = await api.asUser().requestJira(route`/rest/api/3/version/{id}/relatedwork`, {
+  headers: {
+    'Accept': 'application/json'
+  }
+});
+[
+  {
+    "category": "Design",
+    "issueId": 10001,
+    "relatedWorkId": "fabcdef6-7878-1234-beaf-43211234abcd",
+    "title": "Design link",
+    "url": "https://www.atlassian.com"
+  },
+  {
+    "category": "Communications",
+    "relatedWorkId": "fabcdef6-7878-1234-beaf-43211234abce",
+    "title": "Chat application",
+    "url": "https://www.atlassian.com"
+  },
+  {
+    "category": "External Link",
+    "issueId": 10003,
+    "relatedWorkId": "fabcdef6-7878-1234-beaf-43211234abcf",
+    "url": "https://www.atlassian.com"
+  }
+]
+*/

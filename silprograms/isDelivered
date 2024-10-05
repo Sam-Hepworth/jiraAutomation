@@ -1,0 +1,2 @@
+include "customFields";
+return size(getAllLinkedIssues(key, linkImplements, -1)) == 0 ? "False" : "True";

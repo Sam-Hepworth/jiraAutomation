@@ -1,0 +1,185 @@
+/*
+Assign the summary "." to an issue give the issue a summary inherited form the issues it is included in.
+
+If an issues is included in a single issue and the issues have the same summary then changes to summary are inherited.
+*/
+include "echo";
+include "customFields";
+include "issueFields";
+include "createIssue";
+
+// save array of issues as global variable
+struct LinksCache {
+    string[] issues;
+    string age;
+}
+
+// get issues including this issue (parents)
+function getLinkedIssuesEx(string issue, string linkType, integer linkDirection, boolean all, boolean[] visited) {
+    string[] result;
+    if (visited[issue]) {
+        echo("getLinkedIssues: Infinte loop on issue ", issue, " link ", linkType, " direction ", linkDirection);
+    } else {
+        visited[issue] = true;
+        result = getAllLinkedIssues(issue, linkType, linkDirection);
+        if (all) {
+            string[] more;
+            for (string issue in result)
+                more += getLinkedIssuesEx(issue, linkType, linkDirection, true, visited);
+            result = more + result; // return leaf first order
+        }
+    }
+    return result;
+}
+
+// get issues implemented by this issue
+function getIssuesImplementedBy(string issue, boolean all = false) {
+    // echo("getIssuesImplementedBy: Issue:", issue);
+    string[] result = arrayToSet(getLinkedIssuesEx(issue, linkImplements, 1, all, {}));
+    return result;
+}
+// get issues that implements this issue
+function getIssuesImplementing(string issue, boolean all = false) {
+    // echo("getIssuesImplementing: Issue:", issue);
+    string[] result = arrayToSet(getLinkedIssuesEx(issue, linkImplements, -1, all, {}));
+    return result;
+}
+// get issues that are blocked by this issue (returns all blocked issues no matter what their status is)
+function getIssuesBlockedBy(string issue, boolean all = false) {
+    // echo("getIssuesBlockedBy: Issue:", issue);
+    string[] result = arrayToSet(getLinkedIssuesEx(issue, linkBlocks, 1, all, {}));
+    return result;
+}
+// get issues blocking this this issue (returns all blocking issues no matter what their status is)
+function getIssuesBlocking(string issue, boolean all = false) {
+    // echo("getIssuesBlocking: Issue:", issue);
+    string[] result = arrayToSet(getLinkedIssuesEx(issue, linkBlocks, -1, all, {}));
+    return result;
+}
+// get issues related to this issue
+//   - this function generates a lot of "infinite loop" warnings!
+function getIssuesRelatedTo(string issue, boolean all = false) {
+    // echo("getIssuesRelatedTo: Issue:", issue);
+    string[] result = arrayToSet(getLinkedIssuesEx(issue, linkRelates, 0, all, {}));
+    return result;
+}
+
+function getIssuesIncluding(string issue, boolean all = false) {
+    // echo("getIssuesIncluding: Issue:", issue);
+    string[] result = arrayToSet(getLinkedIssuesEx(issue, linkIncludes, -1, all, {}));
+    return result;
+}
+
+// get issues included in this issue (children)
+function getIssuesIncludedIn(string issue, boolean all = false) {
+    // echo("getIssuesIncludedIn: Issue:", issue);
+    string[] result = arrayToSet(getLinkedIssuesEx(issue, linkIncludes, 1, all, {}));
+    return result;
+}
+
+// get all children of issue (no matter what kind of issue)
+//. - children are cached (cache is is invalidated if children are added/removed)
+//  - when all is true return also chidlren of children (children are returned in deep first order)
+function getChildren(string issue, boolean all = false) {
+    // echo("getChildren: Issue:", issue);
+    string issueType = %issue%.issueType;
+    LinksCache item;
+    if (
+        (issueType == issueTypeIdea) or
+        (issueType == issueTypeSubtask) or
+        (issueType == issueTypeTask)
+    ) {
+        // issue is a subtask (cannot have children)
+    } else if (
+        (issueType == issueTypeStage) or
+        (issueType == issueTypeStory) or
+        (issueType == issueTypeBug)
+    ) {
+        // issue is a task (cannot have grand children)
+        item.issues = subtasks(issue);
+    } else {
+        // issue is an epic (can have children and grand children)
+        try {
+            item = fromJson("" + getPersistentVar(issue, "children"));
+        } catch {}
+        if (isCacheExpired(item.age, 5 * 60 * 1000)) {
+            // echo("getChildren: get children for ", issue);
+            item.issues = selectIssues("parent = " + issue, 65535); // if no max is provided a warning is displayed
+            item.age = formatDate(currentDate(), "yyyy-MM-dd HH:mm:ss.SSS");
+            setPersistentVar(issue, "children", toJson(item));
+        } else {
+            // echo("getChildren: cached ", issue);
+        }
+        string[] children;;
+        if (all) {
+            for (string child in item.issues)
+                children += getChildren(child, true);
+        }
+        item.issues = children + item.issues;
+    }
+    return item.issues;
+}
+
+function getParents(string issue, boolean all = false) {
+    string[] result = {};
+    string parent = %issue%.parent;
+    while (parent != "") {
+        result += parent;
+        if (!all) break;
+        parent = %parent%.parent;
+    }
+    return result;
+}
+
+// children and issues implementing this issue
+function getAllChildrenAndImplementing(string issue, boolean all, boolean[] visited) {
+    string[] children;
+    if (visited[issue]) {
+        echo("getAllParentAndImplementedBy: Infinite loop on issue ", issue);
+    } else {
+        visited[issue] = true;
+        children = arrayToSet(getChildren(issue) + getIssuesImplementing(issue));
+        if (all) {
+            string[] more;
+            for (string child in children)
+                more += getAllChildrenAndImplementing(child, true, visited);
+            children = more + children;
+        }
+    }
+    return children;
+}
+function getChildrenAndImplementing(string issue, boolean all = false) {
+    return arrayToSet(getAllChildrenAndImplementing(issue, all, {}));
+}
+
+// get parent and issues implemented by this issue
+//  - if all is true then return nested parents and implemented by issues
+function getAllParentAndImplementedBy(string issue, boolean all, boolean[] visited) {
+    string[] parents;
+    if (visited[issue]) {
+        echo("getAllParentAndImplementedBy: Infinite loop on issue ", issue);
+    } else {
+        visited[issue] = true;
+        parents = getIssuesImplementedBy(issue);
+        string parent = %issue%.parent;
+        if ((parent != "") and !elementExists(parents, parent))
+            parents += parent;
+        if (all) {
+            string[] more;
+            for (string parent in parents)
+                more += getAllParentAndImplementedBy(parent, true, visited);
+            parents = more + parents;
+        }
+    }
+    return parents;
+}
+function getParentAndImplementedBy(string issue, boolean all = false) {
+    return arrayToSet(getAllParentAndImplementedBy(issue, all, {}));
+}
+
+// invalidate cached children
+//  - if called with an empty issue this function does nothing
+function invalidateChildren(string issue) {
+    if (isNotNull(issue))
+        setPersistentVar(issue, "children", "{}");
+}

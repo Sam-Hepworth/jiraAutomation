@@ -1,0 +1,405 @@
+include "echo";
+include "customFields";
+include "issueFieldsRaw";
+include "versions";
+include "status";
+include "sprints";
+include "teams";
+include "projects";
+
+//------------------------------------------------------------------------------
+// add option single or multi-select field
+function addFieldOptions(string issue, string field, string[] values) {
+    if (size(values) != 0) {
+        string[] hasValues;
+        JCustomFieldOption[] addValues;
+        for(JCustomFieldOption option in admGetCustomFieldOptions(field))
+            hasValues += option.value;
+        for (string value in arrayToSet(values)) {
+            if ((value != "") and !elementExists(hasValues, value)) {
+                JCustomFieldOption option;
+                option.value = value;
+                addValues += option;
+            }
+        }
+        if (size(addValues) != 0) {
+            admAddCustomFieldOptions(field, addValues);
+        }
+    }
+}
+
+//------------------------------------------------------------------------------
+// add and/or remove options to/from single or multi-select field
+function updateFieldOptions(string issue, string field, boolean[] values) {
+    string[] currentValues = %issue%.%field%;
+    string[] addValues;
+    string[] removeValues;
+    for (string value in arrayKeys(values)) {
+        boolean exists = elementExists(currentValues, value);
+        if (values[value]) {
+            if (!exists) addValues[value] = value;
+        } else {
+            if (exists) removeValues[value] = value;
+        }
+    }
+    if (size(addValues) != 0) {
+        addFieldOptions(issue, field, addValues);
+        %issue%.%field% += addValues;
+    }
+    if (size(removeValues) != 0) {
+        %issue%.%field% -= removeValues;
+    }
+}
+
+//------------------------------------------------------------------------------
+// set options for single or multi-select field
+function setFieldOptions(string issue, string field, string[] values) {
+    string[] currentValues = %issue%.%field%;
+    string[] addValues;
+    for (string value in values) {
+        if (!elementExists(currentValues, value))
+            addValues[value] = value;
+    }
+    addFieldOptions(issue, field, addValues);
+    %issue%.%field% = values;
+}
+
+//------------------------------------------------------------------------------
+function renameFieldOption(string field, string fromValue, string toValue) {
+    for(JCustomFieldOption option in admGetCustomFieldOptions(field)) {
+        if (option.value == fromValue) {
+            if (toValue == "") {
+                admDeleteCustomFieldOptions(field, {option.optionId}, null);
+            } else {
+                option.value = toValue;
+                admUpdateCustomFieldOptions(field, {option});
+            }
+            break;
+        }
+    }
+}
+
+//------------------------------------------------------------------------------
+// the date fields of an idea
+struct IdeaDateFields {
+    DateRange dateStart;
+    DateRange dateRelease;
+    DateRange dateFinish;
+    string age;
+}
+
+//------------------------------------------------------------------------------
+// team field
+struct IssueTeamField {
+    string id;
+    string name;
+    string age;
+}
+
+//------------------------------------------------------------------------------
+// description field
+struct IssueDescriptionContentItem {
+    string text;
+    string type;
+}
+struct IssueDescriptionContent {
+    IssueDescriptionContentItem[] content;
+    string type;
+}
+struct IssueDescriptionField {
+    IssueDescriptionContent[] content;
+    string type;
+    number version;
+}
+
+//------------------------------------------------------------------------------
+// getIssueFieldsEx
+struct GetIssueFieldsResponseFields {
+    string summary;
+    string customfield_10132; // dateStart
+    string customfield_10133; // dateRelease
+    string customfield_10134; // dateFinish
+    string customfield_10151; // requestDate;
+    string duedate; // duedate
+    string customfield_10015; // startDate
+    IssueTeamField customfield_10001; // Team
+    IssueStatusField status;
+    IssueDescriptionField description;
+}
+struct GetIssueFieldsResponse {
+    string self;
+    string key;
+    string id;
+    GetIssueFieldsResponseFields fields;
+}
+struct GetIssueFields {
+    IdeaDateFields dates;
+    IssueStatusField status;
+    IssueTeamField team;
+}
+function getIssueFieldsEx(string issue) {
+    // echo("getIssueFieldsEx: Issue:", issue);
+    GetIssueFields result;
+    //
+    if (issue == "") number error = 0 / 1; // 0;
+    //
+    string res = getIssueFieldsRaw(issue, "", "?fields=summary,customfield_10132,customfield_10133,customfield_10134,customfield_10001,status,duedate,customfield_10015");
+    GetIssueFieldsResponse response = fromJson(res);
+    //
+    if (%issue%.issueType == issueTypeIdea) {
+        result.dates.dateStart = jsonToDateRange(response.fields.customfield_10132);
+        result.dates.dateRelease = jsonToDateRange(response.fields.customfield_10133);
+        result.dates.dateFinish = jsonToDateRange(response.fields.customfield_10134);
+    } else {
+        result.dates.dateStart.start = response.fields.customfield_10015;
+        result.dates.dateStart.end = response.fields.customfield_10015;
+        result.dates.dateFinish.start = response.fields.duedate;
+        result.dates.dateFinish.end = response.fields.duedate;
+    }
+    result.dates.age = formatDate(currentDate(), "yyyy-MM-dd HH:mm:ss.SSS");
+    setPersistentVar(issue, "ideaDates", toJson(result.dates));
+    //
+    result.status = response.fields.status;
+    result.status.name = getStatusName(result.status.id);
+    result.status.age = result.dates.age;
+    setPersistentVar(issue, "issueStatus", toJson(result.status));
+    //
+    result.team = response.fields.customfield_10001;
+    result.team.age = result.dates.age;
+    setPersistentVar(issue, "issueTeam", toJson(result.team));
+    //
+    return result;
+}
+
+//------------------------------------------------------------------------------
+// get teams field via rest API (note that reults are cahced)
+function getIssueTeamField(string issue) {
+    IssueTeamField team;
+    try {
+        team = fromJson("" + getPersistentVar(issue, "issueTeam"));
+    } catch {}
+    if (isCacheExpired(team.age, 60 * 1000)) // cache for 1 minute
+        team = getIssueFieldsEx(issue).team;
+    return team;    
+}
+
+//------------------------------------------------------------------------------
+// set issue team
+struct setIssueTeamFieldFields {
+    string customfield_10001; // team
+}
+struct SetIssueTeamField {
+    setIssueTeamFieldFields fields;
+}
+function setIssueTeamField(string issue, string teamId) {
+    // set to empty, so that team id and name will be fetched from issue
+    setPersistentVar(issue, "issueTeam", "{}");
+    SetIssueTeamField json;
+    json.fields.customfield_10001 = teamId;
+    setIssueFieldsRaw(issue, toJson(json));
+}
+
+//------------------------------------------------------------------------------
+// invalidate cached issue team field
+function invalidateIssueTeamField(string issue) {
+    setPersistentVar(issue, "issueTeam", "{}"); // invalidate cache
+}
+
+//------------------------------------------------------------------------------
+// get date fields from idea via rest API (note that reults are cahced)
+function getIdeaDateFields(string issue) {
+    IdeaDateFields dates;
+    try {
+        dates = fromJson("" + getPersistentVar(issue, "ideaDates"));
+    } catch {}
+    if (isCacheExpired(dates.age, 60 * 1000)) { // cache for 1 minute
+        dates = getIssueFieldsEx(issue).dates;
+    }
+    return dates;    
+}
+
+//------------------------------------------------------------------------------
+// set idea date fields via rest API (note that cache is also updated)
+struct SetIdeaDateFieldsFields {
+    string customfield_10132; // dateStart
+    string customfield_10133; // dateRelease
+    string customfield_10134; // dateFinish
+}
+struct SetIdeaDateFields {
+    SetIdeaDateFieldsFields fields;
+}
+struct SetIssueDateFieldsFields {
+    string duedate; // dueDate
+    string customfield_10015; // startDate
+}
+struct SetIssueDateFields {
+    SetIssueDateFieldsFields fields;
+}
+function setIdeaDateFields(string issue, IdeaDateFields dates) {
+    // echo("setIdeaDateFields");
+    dates.age = formatDate(currentDate(), "yyyy-MM-dd HH:mm:ss.SSS");
+    setPersistentVar(issue, "ideaDates", toJson(dates));
+    if (%issue%.issueType == issueTypeIdea) {
+        SetIdeaDateFields json;
+        json.fields.customfield_10132 = dateRangeToJson(dates.dateStart);
+        json.fields.customfield_10133 = dateRangeToJson(dates.dateRelease);
+        json.fields.customfield_10134 = dateRangeToJson(dates.dateFinish);
+        setIssueFieldsRaw(issue, toJson(json));
+    } else {
+        SetIssueDateFields json;
+        json.fields.customfield_10015 = dateToString(dates.dateStart.start);
+        json.fields.duedate = dateToString(dates.dateFinish.end);
+        setIssueFieldsRaw(issue, toJson(json));
+    }
+}
+
+//------------------------------------------------------------------------------
+// invalidate cached idea date fields
+function invalidateIdeaDateFields(string issue) {
+    setPersistentVar(issue, "ideaDates", "{}"); // invalidate cache
+}
+
+//------------------------------------------------------------------------------
+// get status transitions
+struct IssueTransition {
+    string name;
+    string id;
+    IssueStatusField to;
+}
+struct IssueTransitions {
+    IssueTransition[] transitions;
+    string age;
+}
+function getIssueStatusTransition(string issue, string status) {
+    string name = "issueTransition_" + %issue%.issueTypeId;
+    IssueTransitions transitions;
+    boolean fromSource;
+    IssueTransition found;
+    while (true) {
+        try {
+            transitions = fromJson("" + getPersistentVar(name));
+        } catch {}
+        if (isCacheExpired(transitions.age, 60 * 1000)) { // cache for 1 minute
+            fromSource = true;
+            string response = getIssueFieldsRaw(issue, "/transitions");
+            transitions = fromJson(response); // do not merge with line below (SIL bug)
+            for (IssueTransition transition in transitions.transitions) {
+                transition.to.name = getStatusName(transition.to.id);
+            }
+            transitions.age = formatDate(currentDate(), "yyyy-MM-dd HH:mm:ss.SSS");
+            setPersistentVar(name, toJson(transitions));
+        }
+        for (IssueTransition transition in transitions.transitions) {
+            if ((transition.to.name == status) or (transition.to.id == status)) {
+                found = transition;
+                break;
+            }
+        }
+        if ((found.id != "") or fromSource)
+            break;
+        setPersistentVar(name, "{}");
+        invalidateStatusDetails();
+    }
+    if (found.id == "")
+        echo("!getIssueStatusTransition Issue:", issue, " no transition to status:", status);
+    return found;
+}
+
+//------------------------------------------------------------------------------
+// get issue status field
+function getIssueStatusField(string issue) {
+    IssueStatusField status;
+    try {
+        status = fromJson("" + getPersistentVar(issue, "issueStatus"));
+    } catch {}
+    if (isCacheExpired(status.age, 60 * 1000)) // cache for 1 minute
+        status = getIssueFieldsEx(issue).status; // TODO: What is status!?
+    return status;
+}
+
+//------------------------------------------------------------------------------
+// get issue status
+function getIssueStatus(string issue) {
+    return getIssueStatusField(issue).name;
+}
+
+//------------------------------------------------------------------------------
+// get issue status category
+function getIssueStatusCategory(string issue) {
+    return getIssueStatusField(issue).statusCategory.key;
+}
+
+//------------------------------------------------------------------------------
+// set status field
+struct SetIssueStatusField {
+    JsonIdField transition;
+}
+function setIssueStatusField(string issue, string status) {
+    // echo("setIssueStatusField Issue:", issue, " Status:", status);
+    IssueTransition transition = getIssueStatusTransition(issue, status);
+    if (transition.id == "") {
+        echo("!setIssueStatusField Issue:", issue, " no transition to status:", status);
+    } else {
+        SetIssueStatusField json;
+        json.transition.id = transition.id;
+        setIssueFieldsRaw(issue, toJson(json), "/transitions");
+        IssueStatusField status = transition.to;
+        status.age = formatDate(currentDate(), "yyyy-MM-dd HH:mm:ss.SSS");
+        setPersistentVar(issue, "issueStatus", toJson(status));
+    }
+    return transition.id != "";
+}
+
+//------------------------------------------------------------------------------
+// invalidate status field cache
+function invalidateIssueStatusField(string issue) {
+    setPersistentVar(issue, "issueStatus", "{}"); // invalidate cache
+}
+
+//------------------------------------------------------------------------------
+// get description field
+function getIssueDescriptionField(string issue) {
+    string res = getIssueFieldsRaw(issue, "" ,"?fields=description");
+    GetIssueFieldsResponse response = fromJson(res);
+    return response.fields.description.content;
+}
+
+//------------------------------------------------------------------------------
+// get request date
+function getIssueRequestDateField(string issue) {
+    string res = getIssueFieldsRaw(issue, "" ,"?fields=customfield_10151");
+    GetIssueFieldsResponse response = fromJson(res);
+    return jsonToDateRange(response.fields.customfield_10151);
+}
+
+//------------------------------------------------------------------------------
+// Set request date
+struct SetIssueRequestDateFields {
+    string customfield_10151;
+}
+struct SetIssueRequestDate {
+    SetIssueRequestDateFields fields;
+}
+function setIssueRequestDateField(string issue, DateRange dateRange) {
+    SetIssueRequestDate json;
+    json.fields.customfield_10151 = dateRangeToJson(dateRange);
+    setIssueFieldsRaw(issue, toJson(json));
+}
+
+//------------------------------------------------------------------------------
+// set issue type
+//  - use issueTypeIdForProject(projectKey, issueTypeName) to get issue type id
+//  - this function does not work well if old and new issue type levels are not
+//    the same. espcially if the issue has a parent or children. 
+struct SetIssueTypeFields {
+    JsonIdField issuetype;
+}
+struct SetIssueType {
+    SetIssueTypeFields fields;
+}
+function setIssueType(string issue, string issueTypeId) {
+    SetIssueType json;
+    json.fields.issuetype.id = issueTypeId;
+    setIssueFieldsRaw(issue, toJson(json));
+}
+

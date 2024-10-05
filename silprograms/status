@@ -1,0 +1,81 @@
+include "echo";
+
+// status categories
+const string statusCategoryNew = "new";
+const string statusCategoryOpen = "indeterminate";
+const string statusCategoryClosed = "done";
+
+// get all status details
+//  - details are cahced in a global variable, the cache is refreshed every 15 minutes
+struct StatusCategory {
+    string key;    
+}
+struct IssueStatusField {
+    string name;
+    string id;
+    StatusCategory statusCategory;
+    string age;
+}
+struct StatusProject {
+    string id;
+}
+struct StatusScope {
+    string type;
+    StatusProject[] project;
+}
+struct StatusDetails {
+    string id;
+    string name;
+    string untranslatedName;
+    StatusCategory statusCategory;
+    StatusScope scope;
+}
+struct StatusDetailsCache {
+    StatusDetails[] statusDetails;
+    string age;
+}
+StatusDetails[] __statusDetailsById;
+function getAllStatusDetails() {
+    if (isNull(__statusDetailsById)) {
+        StatusDetailsCache cache;
+        try {
+            cache = fromJson("" + getPersistentVar("statusDetails")); // incorrect json throws an exception
+        } catch {}
+        if (isCacheExpired(cache.age, 60 * 60 * 1000)) { // cache for 1 hour
+            echo("getStatusDetails: get via API");
+            string response = jiraGet("/rest/api/3/status");
+            cache.statusDetails = fromJson(response); // must store response in variable before calling fromJson
+            cache.age = formatDate(currentDate(), "yyyy-MM-dd HH:mm:ss.SSS");
+            setPersistentVar("statusDetails", toJson(cache));
+        }
+        __statusDetailsById = {};
+        for(StatusDetails item in cache.statusDetails)
+            __statusDetailsById[item.id] = item;
+    }
+    return __statusDetailsById;
+}
+
+// get untranslated name of status
+function getStatusName(string statusId) {
+    StatusDetails[] statusDetails = getAllStatusDetails();
+    string name = statusDetails[statusId].untranslatedName;
+    // echo("getStatusName ", statusId, " ", name);
+    if (name == "") {
+        echo("!getStatusName Unknown status id:", statusId);
+    }
+    return name;
+}
+
+// get statusCatagory from status details
+//  - the scope of the status is ignored (assumes that status names/categories are aligned across projects)
+function getStatusCategory(string status) {
+    string statusCategory = getAllStatusDetails()[status].statusCategory.key;
+    if (statusCategory == "")
+        echo("!getStatusCategory: Unknown status category for status ", status);
+    return statusCategory;
+}
+
+function invalidateStatusDetails() {
+    __statusDetailsById = null;
+    setPersistentVar("statusDetails", "{}");
+}

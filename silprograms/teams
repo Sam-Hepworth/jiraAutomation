@@ -1,0 +1,43 @@
+include "echo";
+
+// get team members
+struct TeamMembership {
+    string teamId;
+    string memberId;
+}
+struct TeamMemberEntity {
+    string state;
+    string role;
+    TeamMembership membershipId;
+}
+struct GetTeamMembers {
+    TeamMemberEntity[] entities;
+}
+struct TeamDetails {
+    string[] members;
+    string age;
+}
+function getTeamMembers(string teamId) {
+    TeamDetails team;
+    if (teamId != "") {
+        string name = "team_" + teamId;
+        try {
+            team = fromJson("" + getPersistentVar(name));
+        } catch {}
+        if (isCacheExpired(team.age, 10 * 60 * 1000)) { // Cache for 10 minutes
+            string response = jiraGet("/gateway/api/v3/teams/" + teamId + "/members");
+            GetTeamMembers result = fromJson(response);
+            team.members = {};
+            for (TeamMemberEntity member in result.entities)
+                team.members += member.membershipId.memberId;
+            team.age = formatDate(currentDate(), "yyyy-MM-dd HH:mm:ss.SSS");
+            echo("getTeamMembers Team:", teamId, " Members:", team.members);
+            setPersistentVar(name, toJson(team));
+        }
+    }
+    return team.members;
+}
+
+function invalidateTeamMembers(string teamId) {
+    setPersistentVar("team_" + teamId, "{}");
+}

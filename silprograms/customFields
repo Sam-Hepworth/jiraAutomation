@@ -1,0 +1,162 @@
+// other files containing custom fields (search for customfield_)
+//  - issueFields
+
+//------------------------------------------------------------------------------
+// custom field for release quarter
+const string releaseQuarterField = "customfield_10140";
+const string responsibleField = "customfield_10144"; // TODO remove
+const string teamField = "customfield_10001"; // TODO remove
+const string releasesField = "customfield_10234"; // TODO remove
+
+//------------------------------------------------------------------------------
+// custom fields for domains
+const string appDomainsFieldId = "customfield_10129";
+const string appDomainsFieldName = "App Domains";
+const string bizDomainsFieldId = "customfield_10224";
+const string bizDomainsFieldName = "Biz Domains";
+const string techDomainsFieldId = "customfield_10129";
+const string techDomainsFieldName = "Tech Domains";
+string[] domainFields;
+domainFields[appDomainsFieldName] = appDomainsFieldId;
+domainFields[bizDomainsFieldName] = bizDomainsFieldId;
+domainFields[techDomainsFieldName] = techDomainsFieldId;
+
+//------------------------------------------------------------------------------
+// custom fields for documentation
+const string docsFieldId = "customfield_10211";
+const string docsFieldName = "Docs";
+const string filesFieldId = "customfield_10179";
+const string filesFieldName = "Files";
+string[] docFields;
+docFields[docsFieldName] = docsFieldId;
+docFields[filesFieldName] = filesFieldId;
+
+//------------------------------------------------------------------------------
+// start/due alerts
+const string alertChildBeforeParent = "Child start < start";
+const string alertChildAfterParent = "Child due > due";
+const string alertDueBeforeStart = "Due < start";
+
+//------------------------------------------------------------------------------
+// status alerts
+const string alertOpenChildren = "Open children"; // parent:closed one or more children:not closed
+const string alertAllChildrenClosed = "No open children"; // parent:open all children:closed
+const string alertNoChildrenDoing = "No doing children";
+const string alertNewChildren = "Not all children are new"; // parent:new 
+const string alertClosedParent = "Parent is closed"; // parent:new 
+const string alertNewParent = "Parent is new"; // parent:new 
+const string alertStatusNotAligned = "Implements status not aligned";
+const string alertStageNotAligned = "Implements stage not aligned";
+const string alertLinkLoop = "Link loop";
+
+//------------------------------------------------------------------------------
+// blocking alerts
+const string alertBlocking = "Blocking";
+const string alertBlocked = "Blocked";
+
+//------------------------------------------------------------------------------
+// status options
+const string statusNew = "NEW";
+const string statusMaybe = "MAYBE";
+const string statusLater = "LATER";
+const string statusNext = "NEXT";
+const string statusDoing = "DOING";
+const string statusDone = "DONE";
+const string statusWontDo = "WON'T DO";
+const string statusDuplicate = "DUPLICATE";
+const string statusIdea = "IS IDEA";
+const string statusSupport = "IS SUPPORT";
+
+//------------------------------------------------------------------------------
+// stage options
+const string stageNew = "";
+const string stageNA = "N/A";
+const string stageDiscover = "DISCOVER";
+const string stageDesign = "DESIGN";
+const string stageDevelop = "DEVELOP";
+const string stageFinalize = "FINALIZE";
+const string stageRelease = "RELEASE";
+const string stageHypercare = "HYPERCARE";
+const string stageEvaluate = "EVALUATE";
+
+//------------------------------------------------------------------------------
+// these stages are created as child issues to feature issues in the plan project
+const string[] createStages = { 
+    stageDiscover,
+    stageDesign,
+    stageDevelop,
+    stageFinalize,
+    stageRelease,
+    stageHypercare,
+    stageEvaluate
+};
+
+//------------------------------------------------------------------------------
+// tags options
+const string tagCommitted = "Committed";
+const string tagPromoted = "Promoted";
+
+//------------------------------------------------------------------------------
+// request channels
+const string requestChannelOnlineForm = "Online form";
+
+//------------------------------------------------------------------------------
+// options options
+const string optionRollupStart = "Rollup start";
+const string optionRollupDue = "Rollup due";
+const string optionRolldownStart = "Rolldown start";
+const string optionRolldownDue = "Rolldown due";
+const string optionInheritIncludes = "Inherit includes";
+const string optionInheritDelivered = "Inherit delivered";
+const string optionStartDueAllSprints = "Start and due span all sprints";
+const string optionRefresh = "Refresh automated fields";
+const string optionHide = "Hide in cross-projects views";
+string[] projectsStartDueAllSprints = {"ES","MS"};
+
+//------------------------------------------------------------------------------
+// link names
+const string linkIncludes = "1-Includes";
+const string linkImplements = "2-Polaris issue link";
+const string linkBlocks = "3-Blocks";
+const string linkRelates = "4-Relates to";
+const string linkDuplicates = "5-Duplicate";
+
+//------------------------------------------------------------------------------
+// issue types (epic, task, sub-task, etc.)
+const string issueTypeFeature = "Feature"; // plan project
+const string issueTypeStage = "Stage"; // plan project
+const string issueTypeOther = "Other"; // plan project
+const string issueTypeTask = "Task"; // plan project
+const string issueTypeEpic = "Epic"; // sprint project
+const string issueTypeStory = "Story"; // sprint project
+const string issueTypeBug = "Bug"; // sprint project
+const string issueTypeSubtask = "Subtask"; // sprint project
+const string issueTypeIdea = "Idea"; // discover project
+const string issueTypeEmailRequest = "Email request"; // support project
+const string issueTypeRequest = "Request"; // support project
+const string issueTypeFeedback = "Feedback"; // support project
+
+//------------------------------------------------------------------------------
+// idea types (idea, feature, etc.)
+const string ideaTypeIdea = "? Idea";
+const string ideaTypeStory = "- Story";
+const string ideaTypeFeature = "= Feature";
+const string ideaTypeObjective = "* Objective";
+const string ideaTypeTheme = "% Theme";
+const string ideaTypeRisk = "! Risk";
+const string ideaTypeOpportunity = "$ Opportunity";
+const string ideaTypeRelease = "# Release";
+const string ideaTypeMetric = "^ Metric";
+
+//------------------------------------------------------------------------------
+// idea types. array key is icon character.
+string[] ideaTypes;
+ideaTypes[ideaTypeIdea] = chop(ideaTypeIdea, 1);
+ideaTypes[ideaTypeStory] = chop(ideaTypeStory, 1);
+ideaTypes[ideaTypeFeature] = chop(ideaTypeFeature, 1);
+ideaTypes[ideaTypeObjective] = chop(ideaTypeObjective, 1);
+ideaTypes[ideaTypeTheme] = chop(ideaTypeTheme, 1);
+ideaTypes[ideaTypeRisk] = chop(ideaTypeRisk, 1);
+ideaTypes[ideaTypeOpportunity] = chop(ideaTypeOpportunity, 1);
+ideaTypes[ideaTypeRelease] = chop(ideaTypeRelease, 1);
+ideaTypes[ideaTypeMetric] = chop(ideaTypeMetric, 1);

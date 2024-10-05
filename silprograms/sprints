@@ -1,0 +1,69 @@
+include "echo";
+
+//------------------------------------------------------------------------------
+// Return the start and end dates of a set of sprints.
+//  - If the sprints have no start/end date return a default start/end date
+//  - Cache sprint start/end dates in the current thread (not across threads)
+DateRange[] sprintDates;
+boolean[] hasSprintDates;
+function getSprintDates(integer[] sprints, string defaultStart, string defaultEnd, boolean allSprints) {
+    DateRange result;
+    if (!allSprints)
+        sprints = subarray(sprints, arraySize(sprints) - 1, arraySize(sprints));
+    for (integer sprint in sprints) {
+        string name = "_" + sprint;
+        DateRange dates;
+        if (hasSprintDates[name]) {
+            dates = sprintDates[name];
+        } else {
+            dates.start = dateToString(sprintStartDate(sprint));
+            dates.end = dateToString(sprintEndDate(sprint));
+            sprintDates[name] = dates;
+            hasSprintDates[name] = true;
+        }
+        if ((dates.start != "") and ((dates.start < result.start) or (result.start == "")))
+            result.start = dates.start;
+        if (dates.end > result.end)
+            result.end = dates.end;
+    }
+    if (result.start == "")
+        result.start = defaultStart;
+    if (result.end == "")
+        result.end = defaultEnd;
+    // echo("getSprintDates: ", sprints, " start:", result.start, " end:", result.end, " defaultStart:", defaultStart, " defaultEnd:", defaultEnd);
+    return result;
+}
+
+//------------------------------------------------------------------------------
+// Return sprints for a given project (sprints of all sprint boards linked to a given project)
+//  - Cache projects sprints in the current thread (not across threads)
+struct ProjectSprints {
+    JSprint[] openSprints;
+    JSprint[] closedSprints;
+    JSprint[] futureSprints;
+    JBoard[] boards;
+}
+ProjectSprints[] projectSprints;
+boolean[] hasProjectSprints;
+function getProjectSprints(string project) {
+    ProjectSprints result;
+    if (hasProjectSprints[project]) {
+        result = projectSprints[project];
+    } else {
+        for (JBoard board in getAllBoards()) {
+            for (string boardProject in projectsForBoard(board.id)) {
+                // echo("getProjectSprints: Board:" , board.id, " Project: ", boardProject);
+                if (project == boardProject) {
+                    result.openSprints += getAllOpenSprints(board.id);
+                    result.closedSprints += getClosedSprints(board.id);
+                    result.futureSprints += getNotStartedSprints(board.id);
+                    result.boards += board;
+                }
+            }
+        }
+        projectSprints[project] = result;
+        hasProjectSprints[project] = true;
+    }
+    return result;
+}
+

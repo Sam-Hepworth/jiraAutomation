@@ -1,0 +1,18 @@
+struct X {
+    string a;
+    string b;
+}
+
+X[] l1;
+X[] l2;
+X x;
+x.a = "a1";
+x.b = "b1";
+l1 += x;
+l2 += x;
+for (X i in l1)
+    i.a = "x";
+for (X i in l1)
+    logPrint("INFO", i);
+for (X i in l2)
+    logPrint("INFO", i);

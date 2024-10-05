@@ -1,0 +1,75 @@
+include "summary";
+
+//------------------------------------------------------------------------------
+// Alerts
+//------------------------------------------------------------------------------
+
+//------------------------------------------------------------------------------
+// set/unset an alert (used with updateAlerts)
+function setAlert(boolean[] alerts, string alert, boolean value) {
+    if (isNull(alerts))
+        alerts = {};
+    alerts[alert] = value;
+    return alerts;
+}
+
+//------------------------------------------------------------------------------
+// update alerts on issue
+//  - update issue alerts
+//  - if updateDelivery is true then also update summary and delivered fields
+function updateAlerts(string issue, boolean[] alerts, boolean updateDelivered = false) {
+    string[] add;
+    string[] remove;
+    string[] _alerts = %issue%.alerts_;
+    // string[] logAdd;
+    // string[] logRemove;
+    for (string key in arrayKeys(alerts)) {
+        if (alerts[key]) {
+            // logAdd += key;
+            if (!arrayElementExists(_alerts, key))
+                add += key;
+        } else {
+            // logRemove += key;
+            if (arrayElementExists(_alerts, key))
+                remove += key;
+        }
+    }
+    // echo("updateAlerts issue:", issue, "add:", join(add, ","), " remove:", join(remove, ","), " add:", join(logAdd, ","), " remove: ", join(logRemove, ","));
+    //if (arraySize(remove) + arraySize(add) > 0)
+    //    echo("updateAlerts issue:", issue, "add:", join(add, ","), " remove:", join(remove, ","));
+    if (arraySize(remove) > 0) {
+        %issue%.alerts_ -= remove;
+        _alerts -= remove;
+    }
+    if (arraySize(add) > 0) {
+        %issue%.alerts_ += add;
+        _alerts += add;
+    }
+    //
+    boolean[] result = {};
+    for (string alert in _alerts)
+        result[alert] = true;
+    //
+    if (updateDelivered) {
+        SummaryDetails details = parseSummary(%issue%.delivered_, true);
+        details.type = ideaTypes[%issue%.ideaType];
+        details.statusMismatch =
+            alerts[alertOpenChildren] or
+            alerts[alertAllChildrenClosed] or
+            alerts[alertNewChildren] or
+            alerts[alertClosedParent] or
+            alerts[alertNewParent] or
+            alerts[alertStatusNotAligned];
+        // update delivered
+        formatSummary(details, "delivered", issue);
+        formatSummary(combineSummary(details, parseSummary(%issue%.summary, false)), "summary", issue);
+    }
+    //
+    return result;
+}
+
+//------------------------------------------------------------------------------
+function infiniteLoop(string where, string issue) {
+    echo(where, " infinite loop on issue ", issue);
+    updateAlerts(issue, setAlert({}, alertLinkLoop, true));
+}

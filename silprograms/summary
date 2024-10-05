@@ -1,0 +1,276 @@
+include "echo";
+include "customFields";
+
+//------------------------------------------------------------------------------
+// Summary
+//------------------------------------------------------------------------------
+
+//------------------------------------------------------------------------------
+// Delivery format:
+//  ✋😴 🎁<releases> ❰startDate⭢dueDate❱
+//  🎁<releases> ❱startDate⭠dueDate❰
+// Summary format:
+//  <type> name ⇓ 🎁<releases>
+//
+// Idea: Add icon to summary that show if issue is implemented by other issues
+const string warnChildStart = "❰⚠";
+const string warnChildDue = "⚠❱";
+const string warnChildStartDue = "❰⚠❱";
+const string scopeForward = "⭢" ;// "🠞"; // fix on osx 
+const string scopeBackward = "⭠"; // "🠜"; // fix on osx 
+const string scopeStart = "❰";
+const string scopeDue = "❱";
+const string scopeNull = "…";
+const string scopeWarn = "⚠";
+const string scopeRelease = "🎁";
+const string scopeImplements = "▲";
+const string scopeImplemented = "▽";
+const string scopeRollup = "⤒";
+const string scopeRolldown = "⤓";
+const string warnBlocked = "😴";
+const string warnBlocking = "✋";
+const string warnStatus = "↭"; //🙃
+const string removeIcons = "(⇑)|(⇓)|(△)";
+struct SummaryDetails {
+    string summary;
+    string type;
+    string releases;
+    string start;
+    string due;
+    string current;
+    boolean blocked;
+    boolean blocking;
+    boolean implements;
+    boolean implemented;
+    boolean rollup;
+    boolean rolldown;
+    boolean dueBeforeStart;
+    boolean childBeforeStart;
+    boolean childAfterDue;
+    boolean statusMismatch;
+}
+
+//------------------------------------------------------------------------------
+// extract information from summary or delivery fields
+//  - parse information in summary/delivered fields
+//  - normally all information except type and summary are parsed from delivered field (this fields is less prone to be edited)
+function parseSummary(string summary, boolean delivery) {
+    SummaryDetails details;
+    details.current = summary;
+    summary = trim(summary);
+    //
+    if (removeIcons != "")
+        summary = matchReplace(summary, removeIcons, "");
+    // type
+    details.type = substring(summary, 0, 1);
+    if (contains(join(ideaTypes, ""), details.type)) {
+        summary = substring(summary, 1, length(summary));
+    } else { 
+        details.type = "";
+    }
+    // scope
+    if (!delivery) {
+        string scope = matchText(summary, "(" + warnChildStartDue + ")|(" + warnChildStart + ")|(" + warnChildDue + ")");
+        summary = replace(summary, scope, "");
+        details.childBeforeStart = indexOf(scope, warnChildStart) != -1;
+        details.childAfterDue = indexOf(scope, warnChildDue) != -1;
+    } else {
+        string scope = matchText(summary, "❰.*❱");
+        summary = replace(summary, scope, "");
+        details.childBeforeStart = indexOf(scope, warnChildStart) != -1;
+        details.childAfterDue = indexOf(scope, warnChildDue) != -1;
+        scope = replace(replace(replace(scope, scopeStart, ""), scopeDue, ""), scopeWarn, "");
+        details.dueBeforeStart = indexOf(scope, scopeForward) == -1;
+        string[] startDue = split(scope, details.dueBeforeStart ? scopeBackward : scopeForward);
+        details.start = startDue[0];
+        if (details.start == scopeNull)
+            details.start = "";
+        details.due = startDue[1];
+        if (details.due == scopeNull)
+            details.due = "";
+    }
+    // rollup
+    {
+        string s = replace(summary, scopeRollup, "");
+        details.rollup = s != summary;
+        summary = s;
+    }
+    // rolldown
+    {
+        string s = replace(summary, scopeRolldown, "");
+        details.rolldown = s != summary;
+        summary = s;
+    }
+    // implemented
+    {
+        string s = replace(summary, scopeImplemented, "");
+        details.implemented = s != summary;
+        summary = s;
+    }
+    // implements
+    {
+        string s = replace(summary, scopeImplements, "");
+        details.implements = s != summary;
+        summary = s;
+    }
+    // blocked
+    {
+        string s = replace(summary, warnBlocked, "");
+        details.blocked = s != summary;
+        summary = s;
+    }
+    // blocking
+    {
+        string s = replace(summary, warnBlocking, "");
+        details.blocking = s != summary;
+        summary = s;
+    }
+    // status
+    {
+        string s = replace(summary, warnStatus, "");
+        details.statusMismatch = s != summary;
+        summary = s;
+    }
+    // release
+    // string s = matchText(summary, "🎁((\\d\\d\\d\\d-\\d\\d-\\d-\\d)|(\\d\\d\\d\\d-\\d\\d)|(\\d\\d\\d\\d-Q\\d))(( «.*»)| |$)");
+    string s = matchText(summary, "🎁.*?( |$)");
+    summary = replace(summary, s, "");
+    details.releases = replace(trim(s), "🎁", "");
+    // summary
+    if (delivery) {
+        details.summary = "";
+    } else {
+        details.summary = trimAll(summary);
+    }
+    //
+    return details;
+}
+
+//------------------------------------------------------------------------------
+function combineSummary(SummaryDetails delivery, SummaryDetails summary) {
+    delivery.summary = summary.summary;
+    delivery.current = summary.current;
+    // delivery.type = summary.type;
+    // delivery.rollup = summary.rollup;
+    // delivery.rolldown = summary.rolldown;
+    // delivery.implements = summary.implements;
+    // delivery.implemented = summary.implemented;
+    return delivery;
+}
+
+//------------------------------------------------------------------------------
+// format information into summary/delivered/path/label fields
+//   - if an issue is specified then it is updated
+function formatSummary(SummaryDetails details, string format, string issue = "") {
+    string summary;
+    if (indexOf("!path!label!summary!delivered!", "!" + format + "!") == -1) {
+        echo("!formatSummary: unknown format ", format);
+    }
+    if (format != "delivered") {
+        // type + summary
+        summary = trimAll(prefixText(details.type, " ", details.summary));
+        if (summary == "") summary = ".";
+    }
+    // path
+    if (format != "path") {
+        if (format == "label") {
+            // label
+            summary = replace(summary, " ", "_");
+        } else {
+            if (format == "summary") {
+                if ((details.type == "") and (details.implements or details.implemented or details.rollup or details.rolldown)) {
+                    summary += " ";
+                    if (details.rollup)
+                        summary += scopeRollup;
+                    if (details.rolldown)
+                        summary += scopeRolldown;
+                    if (details.implements)
+                        summary += scopeImplements;
+                    if (details.implemented)
+                        summary += scopeImplemented;
+                }
+                if (details.childBeforeStart and details.childAfterDue) {
+                    summary += " " + warnChildStartDue;
+                } else if (details.childBeforeStart) {
+                    summary += " " + warnChildStart;
+                } else if (details.childAfterDue) {
+                    summary += " " + warnChildDue;
+                }
+            }
+            // status
+            if (details.statusMismatch)
+                summary = appendText(summary, warnStatus, "");
+            // blocked
+            if (details.blocked)
+                summary = appendText(summary, warnBlocked, " ");
+            // blocking
+            if (details.blocking)
+                summary = appendText(summary, warnBlocking, " ");
+            // releases
+            if (((format == "delivered") or (details.type == "")) and (details.releases != "")) {
+                if ((format == "delivered") or details.implements /*or details.implemented*/)
+                    summary = appendText(summary, "🎁" + details.releases, " ");
+            }
+            // scope
+            if (format == "delivered") {
+                if ((details.start != "") or (details.due != "")) {
+                    if (summary != "") summary += " ";
+                    summary += details.childBeforeStart ? warnChildStart : scopeStart;
+                    summary += details.start == "" ? scopeNull : details.start;
+                    summary += details.dueBeforeStart ? scopeBackward : scopeForward;
+                    summary += details.due == "" ? scopeNull : details.due;
+                    summary += details.childAfterDue ? warnChildDue : scopeDue;
+                }
+                if (details.implements or details.implemented or details.rollup or details.rolldown) {
+                    if (summary != "") summary += " ";
+                    if (details.rollup)
+                        summary += scopeRollup;
+                    if (details.rolldown)
+                        summary += scopeRolldown;
+                    if (details.implemented)
+                        summary += scopeImplemented;
+                    if (details.implements)
+                        summary += scopeImplements;
+                }
+            }
+        }
+    }
+    //
+    if (issue != "") {
+        if (details.current != summary) {
+            if (format == "summary") {
+                %issue%.summary = summary;
+            } else if (format == "delivered") {
+                %issue%.delivered_ = summary;
+            } else {
+                echo("!formatSummary: Issue update only for summary and delivered, but not ", format);
+            }
+            saveModifiedIssuesEx(issue);
+        }
+    }
+    //
+    return summary;
+}
+
+//------------------------------------------------------------------------------
+function defaultSummary(string[] implements, string fallback) {
+    string[][] includedIn;
+    for (string linkedIssue in implements) {
+/*
+        string path;
+        if (linkedIssue.issueType == issueTypeStage)
+            path = %linkedIssue%.path_;
+        path = prefixText(path, " / ", parseSummary(%linkedIssue%.summary, false).summary);
+        includedIn[path] = path;
+*/
+        includedIn[%linkedIssue%.issueType == issueTypeIdea ? 0 : 1] = parseSummary(%linkedIssue%.summary, false).summary;
+    }
+    includedIn[0] = arraySort(includedIn[0], false);
+    includedIn[1] = arraySort(includedIn[1], false);
+    string[] all = includedIn[0] + includedIn[1];
+    string result = fallback;
+    if (arraySize(all) > 0) {
+        result = clipText(join(all, " + "), 255);
+    }
+    return result;
+}

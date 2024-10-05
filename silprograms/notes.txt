@@ -1,0 +1,61 @@
+
+Assign the summary "." to an issue give the issue a summary inherited form the issues it is included in.
+
+If an issues is included in a single issue and the issues have the same summary then changes to summary are inherited.
+
+
+Stage:
+ASSESS - Select what to do with idea
+DISCOVER - Do discovery on idea
+DESIGN - Create design for idea
+DEVELOP - Develop idea
+FINALIZE - Finalize idea and make it ready for release
+RELEASE - Release idea and start using it
+HYPERCARE - Use idea and fix any issus with it
+EVALUATE - Evaluate idea
+DONE - Done working on idea
+WON'T DO - Not planning to work idea.
+
+Status:
+NEW - Idea/issue is new. Decide what to do with it. Stage is always select.
+MAYBE - It is not decided to move forward with this idea/issue.
+LATER - Work on this idea/issue later.
+NEXT - Work on this idea/issue next.
+DOING - Working on idea/issue.
+DONE - Work completed.
+WON'T DO - Don't work on this idea/issue.
+IS DUPLICATE - Automatically set if issue is linked as duplicate
+IS SUPPORT - Automatically set if issue is an idea and issue is a duplicate of an issue that is not an idea
+IS IDEA - Automatically set if issue is not and idea and issue is a duplicate of an issit that is an idea
+
+Idea Status:
+
+Ticket Status:
+NEED MORE INFO
+VERIFY FIX
+
+Alerts:
+Child start < parent start - Child start is before parent start
+Child due > parent due - Child due is after issue due
+Due < start - due date is before start date
+Open children - Issue is closed, but not all children are closed
+No open children - Issue is open, but all children are closed
+Not all children are new - Issue is new, but not all children are new
+Parent is closed - Issue is not closed, but parent is closed
+Parent is new - Issue is not new, but parent is new
+Idea <> delivery - Idea status is different form implementation (feature) status
+Blocking - Blocking other issue
+Blocked - Blocked by other issue (or waiting for is not empty)
+Roadmap is new - Status is not new, but roadmap is new
+Status is new - Roadmap is not new, but status is new
+
+
+
+Verify Fix -> Assign to reporter
+User Story -> Auto create sub-tasks
+Create idea from email
+Create issue from emial
+Update ticket age
+when all children are done move parent to done
+when status is in progress set start date
+when epic is completed close all children

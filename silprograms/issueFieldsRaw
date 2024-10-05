@@ -1,0 +1,15 @@
+include "echo";
+
+// get issue field via REST api
+function getIssueFieldsRaw(string issue, string urlPostfix = "", string params = "") {
+    //https://id.atlassian.com/manage-profile/security/api-tokens
+    return jiraGet("/rest/api/3/issue/" + issue + urlPostfix + params);
+}
+
+// set issue field via REST api
+// POST https://example.net/rest/api/latest/issue/PID-XX/transitions
+// https://dejongh.atlassian.net/rest/api/3/issue/PD-227?fields=summary,status
+function setIssueFieldsRaw(string issue, string json, string urlPostfix = "") {
+    // echo("setIssueFieldsRaw Issue:", issue, " Postfix:", urlPostfix, " Json:", json);
+    return jiraPut("/rest/api/3/issue/" + issue + urlPostfix, json, urlPostfix == "/transitions");
+}

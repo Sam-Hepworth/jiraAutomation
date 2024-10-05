@@ -1,0 +1,26 @@
+include "echo";
+
+string[] projectKeysById;
+JProject[] projectsByKey;
+function getProject(string projectKey) {
+    JProject result = projectsByKey[projectKey];
+    if (result.key == "") {
+        result = projectObject(projectKey);
+        projectsByKey[projectKey] = result;
+        projectKeysById["_" + result.id] = projectKey;
+    }
+    return result;
+}
+
+function getProjectName(string projectKey) {
+    return getProject(projectKey).name;
+}
+
+function getProjectKey(string projectId) {
+    string result = projectKeysById["_" + projectId];
+    if (result == "") {
+        result = getProjectKeyById(projectId);
+        projectKeysById["_" + projectId] = result;
+    }
+    return result;
+}
